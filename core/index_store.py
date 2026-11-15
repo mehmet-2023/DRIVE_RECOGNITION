@@ -217,10 +217,10 @@ class IndexStore:
                         """
                         INSERT OR IGNORE INTO images
                             (file_id, name, path, status, face_count,
-                             width, height, error, updated_at)
-                        VALUES (?, '', '', 'processing', 0, 0, 0, NULL, ?)
+                             width, height, error, updated_at, claimed_at)
+                        VALUES (?, '', '', 'processing', 0, 0, 0, NULL, ?, ?)
                         """,
-                        (file_id, now_iso),
+                        (file_id, now_iso, now_iso),
                     )
                     if cursor.rowcount:
                         claimed.add(file_id)
@@ -230,26 +230,29 @@ class IndexStore:
                         cursor = self.conn.execute(
                             """
                             UPDATE images
-                            SET status = 'processing', updated_at = ?
+                            SET claimed_at = ?,
+                                status = CASE
+                                    WHEN status IN ('done', 'no_face')
+                                    THEN status
+                                    ELSE 'processing'
+                                END
                             WHERE file_id = ?
+                              AND (claimed_at IS NULL OR claimed_at < ?)
                             """,
-                            (now_iso, file_id),
+                            (now_iso, file_id, stale_iso),
                         )
                     else:
                         cursor = self.conn.execute(
                             """
                             UPDATE images
-                            SET status = 'processing', updated_at = ?
+                            SET status = 'processing',
+                                updated_at = ?,
+                                claimed_at = ?
                             WHERE file_id = ?
-                              AND (
-                                  status NOT IN ('done', 'no_face', 'processing')
-                                  OR (
-                                      status = 'processing'
-                                      AND updated_at < ?
-                                  )
-                              )
+                              AND status NOT IN ('done', 'no_face')
+                              AND (claimed_at IS NULL OR claimed_at < ?)
                             """,
-                            (now_iso, file_id, stale_iso),
+                            (now_iso, now_iso, file_id, stale_iso),
                         )
 
                     if cursor.rowcount:

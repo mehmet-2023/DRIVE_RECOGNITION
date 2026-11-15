@@ -640,15 +640,30 @@ rule()
 step_header(
     "02",
     "Yüzünü yükle",
-    "Net, önden çekilmiş ve yüzünün büyük olduğu bir fotoğraf seç.",
+    "Net, önden çekilmiş bir fotoğraf seç veya kamerayla anlık çek.",
 )
 
-face_file = st.file_uploader(
-    "Yüz fotoğrafı",
-    type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
-    key="face_upload",
-    help="Gözlük, maske veya gölge yoksa sonuç daha iyi olur.",
+face_input = st.radio(
+    "Yüz fotoğrafı ekle",
+    ["Fotoğraf yükle", "Kamera ile çek"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="face_input_mode",
 )
+
+if face_input == "Kamera ile çek":
+    face_file = st.camera_input(
+        "Yüz fotoğrafı çek",
+        key="face_camera",
+        help="Kameranı kullanarak anlık bir fotoğraf çek.",
+    )
+else:
+    face_file = st.file_uploader(
+        "Yüz fotoğrafı",
+        type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
+        key="face_upload",
+        help="Gözlük, maske veya gölge yoksa sonuç daha iyi olur.",
+    )
 
 probe_embedding: np.ndarray | None = None
 
@@ -694,9 +709,9 @@ step_header(
 if store is None:
     st.caption("Önce 01'de bir klasör linki gir.")
 elif face_file is None:
-    st.caption("Yüz fotoğrafını yükleyince sonuçlar burada görünür.")
+    st.caption("Yüz fotoğrafını yükleyince veya çekince sonuçlar burada görünür.")
 elif probe_embedding is None:
-    st.caption("Yüz bulunamadı. Daha net bir fotoğraf yükle.")
+    st.caption("Yüz bulunamadı. Daha net bir fotoğraf yükle veya çek.")
 else:
     with st.spinner("Sonuçlar hazırlanıyor..."):
         ensure_remote_loaded(store, pg, key)
