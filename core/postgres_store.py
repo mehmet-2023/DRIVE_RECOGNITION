@@ -231,6 +231,47 @@ class PostgresStore:
 
         return self._run(operation)
 
+    def fetch_existing(self, file_ids: list[str]) -> list[dict]:
+        if not file_ids:
+            return []
+
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT ON (file_id)
+                        file_id, name, path, width, height, status, error, faces
+                    FROM {self.table}
+                    WHERE file_id = ANY(%s::text[])
+                      AND status IN ('done', 'no_face')
+                    ORDER BY file_id, updated_at DESC
+                    """,
+                    (file_ids,),
+                )
+                output: list[dict] = []
+                for row in cursor.fetchall():
+                    faces = row[7]
+                    if isinstance(faces, str):
+                        try:
+                            faces = json.loads(faces)
+                        except ValueError:
+                            faces = []
+                    output.append(
+                        {
+                            "file_id": str(row[0]),
+                            "name": str(row[1] or ""),
+                            "path": str(row[2] or ""),
+                            "width": int(row[3] or 0),
+                            "height": int(row[4] or 0),
+                            "status": str(row[5] or "done"),
+                            "error": row[6],
+                            "faces": faces or [],
+                        }
+                    )
+                return output
+
+        return self._run(operation)
+
     def delete_folder(self, folder_key: str) -> int:
         def operation(conn):
             with conn.cursor() as cursor:

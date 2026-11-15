@@ -54,7 +54,8 @@ class IndexStore:
                     width INTEGER NOT NULL DEFAULT 0,
                     height INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    claimed_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS faces (
@@ -73,6 +74,12 @@ class IndexStore:
                 CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
                 """
             )
+            columns = {
+                str(row[1])
+                for row in self.conn.execute("PRAGMA table_info(images)").fetchall()
+            }
+            if "claimed_at" not in columns:
+                self.conn.execute("ALTER TABLE images ADD COLUMN claimed_at TEXT")
             self.conn.commit()
 
     def _bump(self) -> None:
@@ -125,7 +132,8 @@ class IndexStore:
                     width = excluded.width,
                     height = excluded.height,
                     error = excluded.error,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    claimed_at = NULL
                 """,
                 (
                     file_id,

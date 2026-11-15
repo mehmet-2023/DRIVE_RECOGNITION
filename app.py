@@ -502,17 +502,38 @@ def run_indexing() -> None:
             on_status=on_status,
             on_progress=on_progress,
             on_batch=on_batch,
+            load_cached=(
+                pg.fetch_existing
+                if postgres_ready and pg is not None
+                else None
+            ),
         )
 
         store.set_meta("folder_url", folder_url.strip())
         progress.progress(1.0, text="Bitti")
 
         counters = summary["counters"]
+        realtime_skipped = int(summary.get("skipped_realtime") or 0)
+        cached_skipped = int(summary.get("skipped_cached") or 0)
+        already_indexed = max(
+            0,
+            summary["skipped"] - realtime_skipped - cached_skipped,
+        )
         message = (
             f"{summary['processed']} yeni fotoğraf tarandı, "
-            f"{summary['skipped']} zaten kayıtlıydı, "
+            f"{already_indexed} zaten kayıtlıydı, "
             f"{counters['faces']} yüz bulundu."
         )
+        if cached_skipped:
+            message += (
+                f" {cached_skipped} fotoğraf başka klasördeki indeksten "
+                "yeniden kullanıldı."
+            )
+        if realtime_skipped:
+            message += (
+                f" {realtime_skipped} fotoğraf eşzamanlı tarama "
+                "nedeniyle atlandı."
+            )
         status_box.caption("Tarama bitti.")
         flash("success", message)
         st.rerun()

@@ -81,6 +81,7 @@ def build_index(
     on_status: Callable[[str], None] | None = None,
     on_progress: Callable[[int, int, int, dict], None] | None = None,
     on_batch: Callable[[list[dict]], None] | None = None,
+    load_cached: Callable[[list[str]], list[dict]] | None = None,
 ) -> dict:
     if on_status:
         on_status("Klasör okunuyor...")
@@ -115,6 +116,7 @@ def build_index(
     counters = {"done": 0, "no_face": 0, "error": 0, "faces": 0}
     processed = 0
     realtime_skipped = 0
+    cached_skipped = 0
     batch: list[dict] = []
     sync_errors: list[str] = []
     workers = max(1, min(int(options.workers), 12))
@@ -136,6 +138,23 @@ def build_index(
     try:
         for start in range(0, len(todo), 64):
             chunk = todo[start : start + 64]
+
+            if load_cached is not None:
+                try:
+                    cached_rows = load_cached([item.id for item in chunk])
+                except Exception:
+                    load_cached = None
+                    cached_rows = []
+                if cached_rows:
+                    store.import_rows(cached_rows)
+                    cached_ids = {
+                        str(row.get("file_id"))
+                        for row in cached_rows
+                        if row.get("file_id")
+                    }
+                    chunk = [item for item in chunk if item.id not in cached_ids]
+                    cached_skipped += len(cached_ids)
+
             claimed_ids = store.claim_images(
                 [item.id for item in chunk],
                 force=options.force,
@@ -244,7 +263,7 @@ def build_index(
         executor.shutdown(wait=True)
         flush_batch(force=True)
 
-    skipped += realtime_skipped
+    skipped += realtime_skipped + cached_skipped
     store.set_meta("folder_id", folder_id)
     store.set_meta(
         "last_indexed",
@@ -255,6 +274,8 @@ def build_index(
         "total_found": total_found,
         "processed": processed,
         "skipped": skipped,
+        "skipped_realtime": realtime_skipped,
+        "skipped_cached": cached_skipped,
         "counters": counters,
         "sync_errors": sync_errors,
         "warnings": list(client.warnings),
