@@ -739,7 +739,7 @@ else:
                             "Drive'da aç",
                             drive_view_url(result["file_id"]),
                             width="stretch",
-                        )   
+                        )
 
 rule()
 
