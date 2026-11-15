@@ -1,0 +1,8 @@
+streamlit>=1.38,<2
+numpy==1.26.4
+opencv-contrib-python-headless==4.10.0.84
+Pillow>=10.4,<12
+requests>=2.32,<3
+beautifulsoup4>=4.12,<5
+google-auth>=2.35,<3
+psycopg2-binary>=2.9,<3
