@@ -45,8 +45,9 @@ def draw_label_box(
     w: int,
     h: int,
     label: str,
-    color: tuple[int, int, int] = (245, 158, 11),
+    color: tuple[int, int, int] = (10, 10, 10),
     thickness: int | None = None,
+    text_color: tuple[int, int, int] = (255, 255, 255),
 ) -> None:
     """Görselin üzerine kutu ve etiket çizer (in-place)."""
     ih, iw = image.shape[:2]
@@ -71,7 +72,7 @@ def draw_label_box(
         (x + 6, top + th + 5),
         cv2.FONT_HERSHEY_SIMPLEX,
         font_scale,
-        (10, 18, 32),
+        text_color,
         text_thickness,
         cv2.LINE_AA,
     )

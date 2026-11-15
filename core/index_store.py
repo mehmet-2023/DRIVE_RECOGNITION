@@ -4,7 +4,7 @@ import base64
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -183,6 +183,79 @@ class IndexStore:
             error=error,
             commit=commit,
         )
+
+    def claim_images(
+        self,
+        file_ids: list[str],
+        *,
+        force: bool = False,
+        stale_minutes: int = 30,
+    ) -> set[str]:
+        """SQL'de atomik olarak sahiplenir; başka bir indeksleme işliyorsa atlar."""
+        if not file_ids:
+            return set()
+
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat(timespec="seconds")
+        stale_iso = (now - timedelta(minutes=max(1, int(stale_minutes)))).isoformat(
+            timespec="seconds"
+        )
+        claimed: set[str] = set()
+
+        with self._lock:
+            try:
+                for file_id in file_ids:
+                    cursor = self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO images
+                            (file_id, name, path, status, face_count,
+                             width, height, error, updated_at)
+                        VALUES (?, '', '', 'processing', 0, 0, 0, NULL, ?)
+                        """,
+                        (file_id, now_iso),
+                    )
+                    if cursor.rowcount:
+                        claimed.add(file_id)
+                        continue
+
+                    if force:
+                        cursor = self.conn.execute(
+                            """
+                            UPDATE images
+                            SET status = 'processing', updated_at = ?
+                            WHERE file_id = ?
+                            """,
+                            (now_iso, file_id),
+                        )
+                    else:
+                        cursor = self.conn.execute(
+                            """
+                            UPDATE images
+                            SET status = 'processing', updated_at = ?
+                            WHERE file_id = ?
+                              AND (
+                                  status NOT IN ('done', 'no_face', 'processing')
+                                  OR (
+                                      status = 'processing'
+                                      AND updated_at < ?
+                                  )
+                              )
+                            """,
+                            (now_iso, file_id, stale_iso),
+                        )
+
+                    if cursor.rowcount:
+                        claimed.add(file_id)
+
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+            if claimed:
+                self._bump()
+
+        return claimed
 
     def set_meta(self, key: str, value: str) -> None:
         with self._lock:

@@ -83,7 +83,7 @@ def build_index(
     on_batch: Callable[[list[dict]], None] | None = None,
 ) -> dict:
     if on_status:
-        on_status("Drive klasörü listeleniyor...")
+        on_status("Klasör okunuyor...")
 
     items: list[DriveItem] = []
     seen: set[str] = set()
@@ -101,7 +101,7 @@ def build_index(
 
     total_found = len(items)
     if on_status:
-        on_status(f"{total_found} görsel bulundu. İndeks karşılaştırılıyor...")
+        on_status(f"{total_found} fotoğraf bulundu.")
 
     done_ids = set() if options.force else store.done_ids()
     todo = [item for item in items if item.id not in done_ids]
@@ -109,11 +109,12 @@ def build_index(
 
     if on_status:
         on_status(
-            f"{len(todo)} yeni görsel işlenecek, {skipped} kayıt zaten indekste."
+            f"{len(todo)} fotoğraf işlenecek, {skipped} fotoğraf zaten kayıtlı."
         )
 
     counters = {"done": 0, "no_face": 0, "error": 0, "faces": 0}
     processed = 0
+    realtime_skipped = 0
     batch: list[dict] = []
     sync_errors: list[str] = []
     workers = max(1, min(int(options.workers), 12))
@@ -135,6 +136,15 @@ def build_index(
     try:
         for start in range(0, len(todo), 64):
             chunk = todo[start : start + 64]
+            claimed_ids = store.claim_images(
+                [item.id for item in chunk],
+                force=options.force,
+            )
+            realtime_skipped += len(chunk) - len(claimed_ids)
+            chunk = [item for item in chunk if item.id in claimed_ids]
+            if not chunk:
+                continue
+
             future_map = {
                 executor.submit(
                     client.fetch_image,
@@ -223,12 +233,18 @@ def build_index(
                 batch.append(row)
                 processed += 1
                 if on_progress is not None:
-                    on_progress(processed, len(todo), skipped, counters)
+                    on_progress(
+                        processed,
+                        len(todo),
+                        skipped + realtime_skipped,
+                        counters,
+                    )
                 flush_batch()
     finally:
         executor.shutdown(wait=True)
         flush_batch(force=True)
 
+    skipped += realtime_skipped
     store.set_meta("folder_id", folder_id)
     store.set_meta(
         "last_indexed",
@@ -249,8 +265,8 @@ def search_embeddings(
     matrix: np.ndarray,
     metas: list[dict],
     probes: list[np.ndarray],
-    threshold: float = 0.40,
-    max_results: int = 100,
+    threshold: float = 0.50,
+    max_results: int | None = None,
 ) -> list[dict]:
     if matrix.size == 0 or not probes or not metas:
         return []
@@ -285,4 +301,6 @@ def search_embeddings(
         key=lambda item: item["score"],
         reverse=True,
     )
+    if max_results is None:
+        return results
     return results[: max(1, int(max_results))]
