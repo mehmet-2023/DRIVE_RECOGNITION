@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import faulthandler
 import gc
 import hashlib
 import io
 import json
+import os
+import threading
+import time
 import traceback
 import zipfile
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import streamlit as st
+
+faulthandler.enable()
 
 try:
     from starlette.requests import ClientDisconnect as _ClientDisconnect
@@ -26,6 +33,10 @@ st.set_page_config(
 )
 
 PREVIEW_THUMB_SIZE = 384
+MEMORY_HIGH_WATERMARK_RATIO = 0.80
+MEMORY_RECOVERY_RATIO = 0.68
+FALLBACK_LIMIT_MB = 1024.0
+MAX_CONCURRENT_HEAVY_JOBS = 2
 
 st.markdown(
     """
@@ -100,6 +111,25 @@ st.markdown(
         line-height: 1.55;
         max-width: 560px;
         margin: 0;
+    }
+
+    .overload-banner {
+        border: 2px solid var(--line);
+        background: var(--soft);
+        padding: 20px 24px;
+        margin: 0 0 32px;
+    }
+    .overload-title {
+        font-family: 'Space Mono', monospace;
+        font-weight: 700;
+        font-size: .95rem;
+        letter-spacing: -.02em;
+        margin-bottom: 6px;
+    }
+    .overload-body {
+        font-size: .9rem;
+        line-height: 1.5;
+        color: var(--ink);
     }
 
     .step-head {
@@ -283,6 +313,116 @@ st.markdown(
 )
 
 
+def read_container_memory_mb() -> tuple[float, float]:
+    used_mb = 0.0
+    limit_mb = FALLBACK_LIMIT_MB
+
+    cgroup_v2_current = Path("/sys/fs/cgroup/memory.current")
+    cgroup_v2_max = Path("/sys/fs/cgroup/memory.max")
+    cgroup_v1_usage = Path("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    cgroup_v1_limit = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+    try:
+        if cgroup_v2_current.exists():
+            used_mb = int(cgroup_v2_current.read_text().strip()) / (1024 * 1024)
+            if cgroup_v2_max.exists():
+                raw_max = cgroup_v2_max.read_text().strip()
+                if raw_max.isdigit():
+                    parsed_max = int(raw_max) / (1024 * 1024)
+                    if 128.0 <= parsed_max <= 65536.0:
+                        limit_mb = parsed_max
+        elif cgroup_v1_usage.exists():
+            used_mb = int(cgroup_v1_usage.read_text().strip()) / (1024 * 1024)
+            if cgroup_v1_limit.exists():
+                raw_lim = cgroup_v1_limit.read_text().strip()
+                if raw_lim.isdigit():
+                    parsed_lim = int(raw_lim) / (1024 * 1024)
+                    if 128.0 <= parsed_lim <= 65536.0:
+                        limit_mb = parsed_lim
+        else:
+            status_path = Path("/proc/self/status")
+            if status_path.exists():
+                for line in status_path.read_text().splitlines():
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            used_mb = int(parts[1]) / 1024.0
+                        break
+    except Exception:
+        pass
+
+    return used_mb, limit_mb
+
+
+class ServerGuard:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.active_jobs = 0
+        self.tripped = False
+        self.tripped_reason = ""
+        self.tripped_at = 0.0
+        self.last_gc_at = 0.0
+
+    def evaluate(self) -> tuple[bool, str, float, float]:
+        used_mb, limit_mb = read_container_memory_mb()
+        ratio = (used_mb / limit_mb) if limit_mb > 0 else 0.0
+        now = time.monotonic()
+
+        with self._lock:
+            if ratio >= MEMORY_HIGH_WATERMARK_RATIO:
+                if not self.tripped:
+                    self.tripped = True
+                    self.tripped_at = now
+                self.tripped_reason = (
+                    f"Sunucu bellek yükü kritik seviyeye ulaştı (%{ratio * 100:.0f})."
+                )
+            elif self.tripped:
+                if (
+                    ratio <= MEMORY_RECOVERY_RATIO
+                    and self.active_jobs == 0
+                    and (now - self.tripped_at) >= 5.0
+                ):
+                    self.tripped = False
+                    self.tripped_reason = ""
+
+            if self.tripped and (now - self.last_gc_at) >= 3.0:
+                self.last_gc_at = now
+                gc.collect()
+
+            if self.tripped:
+                return True, self.tripped_reason, used_mb, limit_mb
+
+            if self.active_jobs >= MAX_CONCURRENT_HEAVY_JOBS:
+                return (
+                    True,
+                    "Şu anda aynı anda çok fazla tarama veya analiz işlemi yürütülüyor.",
+                    used_mb,
+                    limit_mb,
+                )
+
+            return False, "", used_mb, limit_mb
+
+    def try_acquire_job(self) -> tuple[bool, str]:
+        blocked, reason, _, _ = self.evaluate()
+        if blocked:
+            return False, reason
+        with self._lock:
+            if self.tripped or self.active_jobs >= MAX_CONCURRENT_HEAVY_JOBS:
+                return False, "Sistem yoğunluğu nedeniyle yeni işlem geçici olarak durduruldu."
+            self.active_jobs += 1
+            return True, ""
+
+    def release_job(self) -> None:
+        with self._lock:
+            self.active_jobs = max(0, self.active_jobs - 1)
+        gc.collect()
+
+
+@st.cache_resource(show_spinner=False)
+def get_server_guard() -> ServerGuard:
+    return ServerGuard()
+
+
 def flash(kind: str, message: str) -> None:
     st.session_state["_flash"] = (kind, message)
 
@@ -361,6 +501,9 @@ def main_app() -> None:
     from core.pipeline import IndexOptions, build_index, search_embeddings
     from core.postgres_store import PostgresError, PostgresStore
 
+    guard = get_server_guard()
+    system_overloaded, overload_reason, used_mb, limit_mb = guard.evaluate()
+
     @st.cache_resource(show_spinner=False)
     def get_engine_cached() -> FaceEngine | None:
         try:
@@ -383,7 +526,7 @@ def main_app() -> None:
             raise PostgresError("Kalıcı kayıt ayarı bulunamadı.")
         return PostgresStore(config)
 
-    @st.cache_data(show_spinner=False, max_entries=24)
+    @st.cache_data(show_spinner=False, max_entries=16)
     def analyze_upload_cached(
         data: bytes, det_threshold: float, min_face: int
     ) -> dict:
@@ -408,6 +551,7 @@ def main_app() -> None:
                 max_faces=10,
                 input_max_side=1280,
             )
+            del image_bgr
             return {"error": None, "faces": faces}
         except Exception as exc:
             return {
@@ -415,7 +559,7 @@ def main_app() -> None:
                 "faces": [],
             }
 
-    @st.cache_data(ttl=1800, max_entries=48, show_spinner=False)
+    @st.cache_data(ttl=1800, max_entries=32, show_spinner=False)
     def get_display_image(
         file_id: str,
         size: int,
@@ -429,7 +573,7 @@ def main_app() -> None:
         except Exception:
             return None
 
-    @st.cache_data(ttl=1800, max_entries=48, show_spinner=False)
+    @st.cache_data(ttl=1800, max_entries=32, show_spinner=False)
     def get_download_file(
         file_id: str,
         api_key: str,
@@ -442,7 +586,7 @@ def main_app() -> None:
         except Exception:
             return None
 
-    @st.cache_data(ttl=1800, max_entries=8, show_spinner=False)
+    @st.cache_data(ttl=1800, max_entries=4, show_spinner=False)
     def build_preview_zip(
         entries: tuple[tuple[str, str], ...],
         api_key: str,
@@ -453,6 +597,9 @@ def main_app() -> None:
         used: dict[str, int] = {}
         with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
             for file_id, name in entries:
+                blocked_now, _, _, _ = guard.evaluate()
+                if blocked_now:
+                    break
                 try:
                     image = get_display_image(
                         file_id,
@@ -698,6 +845,26 @@ def main_app() -> None:
         unsafe_allow_html=True,
     )
 
+    if system_overloaded:
+        st.markdown(
+            f"""
+            <div class="overload-banner">
+              <div class="overload-title">SİSTEM YOĞUNLUĞU · GEÇİCİ KORUMA MODU</div>
+              <div class="overload-body">
+                Çok fazla işlem yapıldığı için sunucu kaynakları şu an sınırda
+                ({used_mb:.0f} MB / {limit_mb:.0f} MB). {overload_reason}
+                Sistem rahatlayana kadar tüm yeni tarama ve analiz işlemleri
+                geçici olarak durduruldu. Birkaç saniye bekleyip aşağıdaki
+                butonla durumu yenileyebilirsin.
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Sistem durumunu kontrol et / Yenile", type="primary", width="stretch"):
+            gc.collect()
+            st.rerun()
+
     show_flash()
 
     step_header(
@@ -722,7 +889,9 @@ def main_app() -> None:
     except Exception:
         saved_folders = []
 
-    indexing_locked = st.session_state.get("_pending_force") is not None
+    indexing_locked = (
+        st.session_state.get("_pending_force") is not None or system_overloaded
+    )
 
     folder_mode = "Yeni klasör linki"
     if saved_folders:
@@ -779,6 +948,7 @@ def main_app() -> None:
             key="folder_url",
             placeholder="https://drive.google.com/drive/folders/...",
             label_visibility="collapsed",
+            disabled=system_overloaded,
         )
 
     folder_id: str | None = None
@@ -910,12 +1080,26 @@ def main_app() -> None:
             "ile yenileyebilirsin."
         )
     elif scan_clicked or rescan_clicked:
-        st.session_state["_pending_force"] = rescan_clicked
-        st.rerun()
+        if system_overloaded:
+            st.warning(
+                "Çok fazla işlem yapıldığı için sistem şu an korumada. "
+                "Bellek rahatlayınca tekrar deneyebilirsin."
+            )
+        else:
+            st.session_state["_pending_force"] = rescan_clicked
+            st.rerun()
 
     def run_indexing(force_flag: bool) -> None:
         if store is None or not folder_id or not key:
             st.warning("Önce bir Drive klasör linki gir.")
+            return
+
+        acquired, deny_reason = guard.try_acquire_job()
+        if not acquired:
+            st.warning(
+                f"Çok fazla işlem yapıldı: {deny_reason} "
+                "Sistem rahatlayana kadar bekleyip tekrar dene."
+            )
             return
 
         status_box = st.empty()
@@ -951,12 +1135,22 @@ def main_app() -> None:
             if drive_date:
                 store.set_meta("folder_date", drive_date)
 
+            aborted_by_memory = False
+
             def on_status(message: str) -> None:
                 status_box.caption(message)
 
             def on_progress(
                 done: int, total: int, skipped: int, counters: dict
             ) -> None:
+                nonlocal aborted_by_memory
+                cur_used, cur_limit = read_container_memory_mb()
+                if cur_limit > 0 and (cur_used / cur_limit) >= MEMORY_HIGH_WATERMARK_RATIO:
+                    aborted_by_memory = True
+                    guard.evaluate()
+                    raise MemoryError(
+                        "Sunucu bellek sınırı yaklaştığı için tarama güvenli şekilde duraklatıldı."
+                    )
                 fraction = (done / total) if total else 1.0
                 progress.progress(
                     min(1.0, fraction),
@@ -1030,7 +1224,18 @@ def main_app() -> None:
                 message += " Uyarı: " + " ".join(warn_list[:3])
             status_box.caption("Tarama bitti.")
             flash("success", message)
-            gc.collect()
+            st.rerun()
+        except MemoryError as mem_exc:
+            try:
+                store.flush()
+            except Exception:
+                pass
+            status_box.caption("Yoğunluk nedeniyle tarama duraklatıldı.")
+            flash(
+                "warning",
+                f"Çok fazla işlem yapıldı: {mem_exc} "
+                "Şu ana kadar taranan fotoğraflar kaydedildi; sistem rahatlayınca kaldığı yerden devam edebilirsin.",
+            )
             st.rerun()
         except DriveError as exc:
             status_box.caption("Tarama tamamlanamadı.")
@@ -1041,9 +1246,9 @@ def main_app() -> None:
                 f"Fotoğraflar taranırken hata oluştu ({type(exc).__name__}): {exc}"
             )
         finally:
-            gc.collect()
+            guard.release_job()
 
-    if indexing_locked:
+    if st.session_state.get("_pending_force") is not None:
         force_reindex = bool(st.session_state.pop("_pending_force", False))
         try:
             run_indexing(force_reindex)
@@ -1061,31 +1266,38 @@ def main_app() -> None:
         "Seçilen resimler hiçbir yere gönderilmez; yalnızca taranan fotoğraflarla karşılaştırılır.",
     )
 
-    face_input = st.radio(
-        "Yüz fotoğrafı ekle",
-        ["Fotoğraf yükle", "Kamera ile çek"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="face_input_mode",
-    )
-
-    if face_input == "Kamera ile çek":
-        face_file = st.camera_input(
-            "Yüz fotoğrafı çek",
-            key="face_camera",
-            help="Kameranı kullanarak anlık bir fotoğraf çek.",
+    if system_overloaded:
+        st.warning(
+            "Çok fazla işlem yapıldığı için yüz yükleme ve analiz geçici olarak "
+            "kilitlendi. Sistem rahatlayana kadar lütfen bekle."
         )
+        face_file = None
     else:
-        face_file = st.file_uploader(
-            "Yüz fotoğrafı",
-            type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
-            key="face_upload",
-            help="Gözlük, maske veya gölge yoksa sonuç daha iyi olur.",
+        face_input = st.radio(
+            "Yüz fotoğrafı ekle",
+            ["Fotoğraf yükle", "Kamera ile çek"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="face_input_mode",
         )
+
+        if face_input == "Kamera ile çek":
+            face_file = st.camera_input(
+                "Yüz fotoğrafı çek",
+                key="face_camera",
+                help="Kameranı kullanarak anlık bir fotoğraf çek.",
+            )
+        else:
+            face_file = st.file_uploader(
+                "Yüz fotoğrafı",
+                type=["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff"],
+                key="face_upload",
+                help="Gözlük, maske veya gölge yoksa sonuç daha iyi olur.",
+            )
 
     probe_embedding: np.ndarray | None = None
 
-    if face_file is not None:
+    if face_file is not None and not system_overloaded:
         upload_result = None
         try:
             file_bytes = face_file.getvalue()
@@ -1096,17 +1308,27 @@ def main_app() -> None:
             st.error(f"Dosya okunamadı: {exc}")
 
         if file_bytes:
-            try:
-                with st.spinner("Yüz aranıyor..."):
-                    upload_result = analyze_upload_cached(
-                        file_bytes,
-                        det_threshold,
-                        min_face,
-                    )
-            except _DISCONNECT_EXC:
-                upload_result = None
-            except Exception as exc:
-                st.error(f"Yüz analizi sırasında hata oluştu: {exc}")
+            acquired, deny_reason = guard.try_acquire_job()
+            if not acquired:
+                st.warning(
+                    f"Çok fazla işlem yapıldı: {deny_reason} "
+                    "Sistem rahatlayana kadar lütfen bekle."
+                )
+            else:
+                try:
+                    with st.spinner("Yüz aranıyor..."):
+                        upload_result = analyze_upload_cached(
+                            file_bytes,
+                            det_threshold,
+                            min_face,
+                        )
+                except _DISCONNECT_EXC:
+                    upload_result = None
+                except Exception as exc:
+                    st.error(f"Yüz analizi sırasında hata oluştu: {exc}")
+                finally:
+                    del file_bytes
+                    guard.release_job()
 
         if upload_result is not None:
             if upload_result.get("error"):
@@ -1132,7 +1354,11 @@ def main_app() -> None:
         "Sonuçlar benzerlik sırasına göre gelir.",
     )
 
-    if store is None:
+    if system_overloaded:
+        st.caption(
+            "Çok fazla işlem yapıldığı için sonuçlar sistem rahatlayana kadar bekletiliyor."
+        )
+    elif store is None:
         st.caption("Önce 01'de bir klasör seç veya Drive klasör linki gir.")
     elif face_file is None:
         st.caption("Yüz fotoğrafını yükleyince veya çekince sonuçlar burada görünür.")
@@ -1196,36 +1422,47 @@ def main_app() -> None:
                     st.session_state["_zip_request_key"] = key
 
                 if st.session_state.get("_zip_request_key") == key:
-                    zip_bytes = b""
-                    try:
-                        with st.spinner("Önizlemeler paketleniyor..."):
-                            zip_bytes = build_preview_zip(
-                                tuple(
-                                    (r["file_id"], r["name"]) for r in results
-                                ),
-                                api_key,
-                                credentials_identity,
-                                resource_key,
-                            )
-                    except _DISCONNECT_EXC:
-                        zip_bytes = b""
+                    acquired_zip, deny_zip = guard.try_acquire_job()
+                    if not acquired_zip:
                         st.warning(
-                            "Bağlantı kesildi; ZIP oluşturulamadı. Tekrar dene."
-                        )
-                    except Exception as exc:
-                        zip_bytes = b""
-                        st.error(f"ZIP hazırlanırken hata oluştu: {exc}")
-                    if zip_bytes:
-                        st.download_button(
-                            "ZIP dosyasını indir",
-                            zip_bytes,
-                            file_name="eslesen_onizlemeler.zip",
-                            mime="application/zip",
-                            width="stretch",
-                            key=f"zip_download_{key}",
+                            f"Çok fazla işlem yapıldı: {deny_zip} "
+                            "ZIP oluşturma geçici olarak durduruldu."
                         )
                     else:
-                        st.caption("Önizleme paketi hazırlanamadı, tekrar dene.")
+                        zip_bytes = b""
+                        try:
+                            with st.spinner("Önizlemeler paketleniyor..."):
+                                zip_bytes = build_preview_zip(
+                                    tuple(
+                                        (r["file_id"], r["name"])
+                                        for r in results
+                                    ),
+                                    api_key,
+                                    credentials_identity,
+                                    resource_key,
+                                )
+                        except _DISCONNECT_EXC:
+                            zip_bytes = b""
+                            st.warning(
+                                "Bağlantı kesildi; ZIP oluşturulamadı. Tekrar dene."
+                            )
+                        except Exception as exc:
+                            zip_bytes = b""
+                            st.error(f"ZIP hazırlanırken hata oluştu: {exc}")
+                        finally:
+                            guard.release_job()
+
+                        if zip_bytes:
+                            st.download_button(
+                                "ZIP dosyasını indir",
+                                zip_bytes,
+                                file_name="eslesen_onizlemeler.zip",
+                                mime="application/zip",
+                                width="stretch",
+                                key=f"zip_download_{key}",
+                            )
+                        else:
+                            st.caption("Önizleme paketi hazırlanamadı, tekrar dene.")
 
                 columns = st.columns(3, gap="medium")
 
