@@ -24,6 +24,16 @@ def bgr_to_rgb(image: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
+def encode_jpeg_bytes(image: np.ndarray, quality: int = 92) -> bytes:
+    """BGR numpy görselini JPEG baytlarına dönüştürür."""
+    ok, buffer = cv2.imencode(
+        ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+    )
+    if not ok:
+        return b""
+    return buffer.tobytes()
+
+
 def resize_max_side(image: np.ndarray, max_side: int) -> tuple[np.ndarray, float]:
     h, w = image.shape[:2]
     longest = max(h, w)

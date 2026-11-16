@@ -26,7 +26,7 @@ from .config import (
     DRIVE_SCOPE,
     IMAGE_EXTENSIONS,
 )
-from .image_utils import decode_image_bytes
+from .image_utils import decode_image_bytes, encode_jpeg_bytes
 
 _FOLDER_RE = re.compile(r"/folders/([-\w]{10,})")
 _ID_QUERY_RE = re.compile(r"[?&]id=([-\w]{10,})")
@@ -243,6 +243,100 @@ class DriveClient:
             if api_error is not None:
                 raise DriveError(f"{exc}\n\nDrive API ayrıntısı: {api_error}") from exc
             raise
+
+    def get_folder_meta(self, folder_id: str) -> dict:
+        """Klasörün adını ve Drive tarihlerini (yükleme/oluşturma) döndürür."""
+        if self._creds is None and not self.api_key:
+            return {}
+
+        params: dict = {
+            "fields": "id,name,createdTime,modifiedTime",
+            "supportsAllDrives": "true",
+        }
+        if self._creds is None:
+            params["key"] = self.api_key
+
+        try:
+            response = self._request(
+                "GET",
+                f"https://www.googleapis.com/drive/v3/files/{folder_id}",
+                params=params,
+                headers={"Accept": "application/json"},
+                auth=self._creds is not None,
+            )
+        except DriveError:
+            return {}
+
+        if response.status_code != 200:
+            return {}
+
+        try:
+            payload = response.json()
+        except ValueError:
+            return {}
+
+        return {
+            "name": str(payload.get("name") or ""),
+            "created_time": str(payload.get("createdTime") or ""),
+            "modified_time": str(payload.get("modifiedTime") or ""),
+        }
+
+    def _get_file_parents(self, file_id: str) -> list[str]:
+        if self._creds is None and not self.api_key:
+            return []
+
+        params: dict = {"fields": "parents", "supportsAllDrives": "true"}
+        if self._creds is None:
+            params["key"] = self.api_key
+
+        try:
+            response = self._request(
+                "GET",
+                f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                params=params,
+                headers={"Accept": "application/json"},
+                auth=self._creds is not None,
+            )
+        except DriveError:
+            return []
+
+        if response.status_code != 200:
+            return []
+        try:
+            return list(response.json().get("parents") or [])
+        except ValueError:
+            return []
+
+    def resolve_folder_from_file(self, file_id: str, depth: int) -> dict:
+        """Bir dosyadan yukarı yürüyerek kök klasörü ve metasını döndürür."""
+        current = file_id
+        for _ in range(max(0, int(depth)) + 1):
+            parents = self._get_file_parents(current)
+            if not parents:
+                return {}
+            current = parents[0]
+
+        meta = self.get_folder_meta(current)
+        if not meta:
+            return {}
+        meta["id"] = current
+        return meta
+
+    def count_images(
+        self,
+        folder_id: str,
+        resource_key: str | None = None,
+        include_subfolders: bool = True,
+    ) -> int:
+        """Klasördeki (alt klasörler dahil) fotoğraf sayısını döndürür."""
+        seen: set[str] = set()
+        for item in self.walk_images(
+            folder_id,
+            include_subfolders=include_subfolders,
+            resource_key=resource_key,
+        ):
+            seen.add(item.id)
+        return len(seen)
 
     def _list_children_api(self, folder_id: str) -> list[DriveItem]:
         url = "https://www.googleapis.com/drive/v3/files"
@@ -520,5 +614,68 @@ class DriveClient:
             image = decode_image_bytes(data)
             if image is not None:
                 return image
+
+        return None
+
+    def fetch_file_bytes(
+        self, file_id: str, resource_key: str | None = None
+    ) -> tuple[bytes, str] | None:
+        """Görselin orijinal (normal kalite) baytlarını ve MIME türünü getirir."""
+        candidates: list[tuple[str, dict, bool]] = []
+
+        if self._creds is not None or self.api_key:
+            media_params: dict = {"alt": "media", "supportsAllDrives": "true"}
+            if self._creds is None:
+                media_params["key"] = self.api_key
+            candidates.append(
+                (
+                    f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                    media_params,
+                    self._creds is not None,
+                )
+            )
+
+        download_params: dict = {"id": file_id, "export": "download"}
+        if resource_key:
+            download_params["resourcekey"] = resource_key
+        candidates.append(
+            ("https://drive.usercontent.google.com/download", download_params, False)
+        )
+
+        for url, params, use_auth in candidates:
+            try:
+                response = self._request(
+                    "GET",
+                    url,
+                    params=params,
+                    auth=use_auth and self._creds is not None,
+                    headers={"Accept": "image/*,*/*;q=0.8"},
+                )
+            except DriveError:
+                continue
+
+            if response.status_code != 200:
+                continue
+
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "text/html" in content_type:
+                continue
+
+            data = response.content
+            if not data or len(data) < 1024:
+                continue
+            head = data[:32].lstrip().lower()
+            if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+                continue
+
+            if decode_image_bytes(data) is not None:
+                mime = content_type.split(";")[0].strip() or "application/octet-stream"
+                return data, mime
+
+        fallback = self.fetch_image(file_id, 2048, resource_key)
+        if fallback is not None:
+            encoded = encode_jpeg_bytes(fallback)
+            if encoded:
+                return encoded, "image/jpeg"
 
         return None

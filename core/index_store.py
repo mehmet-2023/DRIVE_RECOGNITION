@@ -340,6 +340,18 @@ class IndexStore:
             ).fetchone()
         return row is not None
 
+    def sample_image(self) -> tuple[str, str] | None:
+        """En sığ yollu bir fotoğrafın (file_id, path) değerini döndürür."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT file_id, path FROM images "
+                "WHERE path IS NOT NULL AND path != '' "
+                "ORDER BY LENGTH(path) ASC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        return str(row[0]), str(row[1] or "")
+
     def done_ids(self) -> set[str]:
         with self._lock:
             rows = self.conn.execute(

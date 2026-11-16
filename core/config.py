@@ -8,7 +8,7 @@ from typing import Any
 
 import streamlit as st
 
-APP_TITLE = "Etkinlikler İçin Drive Yüz Tanıma Sistemi"
+APP_TITLE = "Drive Yüz Tanıma Sistemi"
 APP_BRAND = "BY OCAL"
 
 MODEL_DIR = Path(os.environ.get("DRIVE_FACE_MODEL_DIR", "/tmp/drive_face_models"))

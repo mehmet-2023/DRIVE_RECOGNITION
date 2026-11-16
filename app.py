@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 
 import numpy as np
 import streamlit as st
 
 st.set_page_config(
-    page_title="Etkinlikler İçin Drive Yüz Tanıma | BY OCAL",
+    page_title="Drive Yüz Tanıma",
     page_icon="⬛",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -29,7 +30,7 @@ from core.config import (  # noqa: E402
 )
 from core.drive import DriveClient, DriveError, parse_drive_folder_url  # noqa: E402
 from core.face_engine import FaceEngine, ensure_models  # noqa: E402
-from core.image_utils import bgr_to_rgb, decode_image_bytes, draw_label_box  # noqa: E402
+from core.image_utils import bgr_to_rgb, decode_image_bytes  # noqa: E402
 from core.index_store import IndexStore  # noqa: E402
 from core.pipeline import IndexOptions, build_index, search_embeddings  # noqa: E402
 from core.postgres_store import PostgresError, PostgresStore  # noqa: E402
@@ -136,6 +137,15 @@ st.markdown(
         font-size: .9rem;
         line-height: 1.45;
         margin-top: 3px;
+        max-width: 640px;
+    }
+    .step-note {
+        color: var(--muted);
+        font-size: .78rem;
+        line-height: 1.4;
+        margin-top: 6px;
+        padding-left: 10px;
+        border-left: 2px solid var(--line);
         max-width: 640px;
     }
     .rule {
@@ -269,7 +279,7 @@ st.markdown(
     }
 
     @media (max-width: 700px) {
-        .block-container { padding: 0 16px 56px; }
+        .block-container { padding: 1.75rem 16px 56px; }
         .hero { padding: 36px 22px; margin-bottom: 36px; }
         .hero-top { flex-direction: column; gap: 10px; margin-bottom: 28px; }
         .step-head { gap: 12px; }
@@ -299,7 +309,10 @@ def show_flash() -> None:
     renderer(message)
 
 
-def step_header(number: str, title: str, description: str) -> None:
+def step_header(
+    number: str, title: str, description: str, note: str = ""
+) -> None:
+    note_html = f'<div class="step-note">{note}</div>' if note else ""
     st.markdown(
         f"""
         <div class="step-head">
@@ -307,6 +320,7 @@ def step_header(number: str, title: str, description: str) -> None:
           <div>
             <div class="step-title">{title}</div>
             <div class="step-desc">{description}</div>
+            {note_html}
           </div>
         </div>
         """,
@@ -377,22 +391,184 @@ def get_display_image(
     return client.fetch_image(file_id, size, resource_key)
 
 
-def annotate_result(image_bgr: np.ndarray, result: dict) -> np.ndarray:
-    image = image_bgr.copy()
-    stored_width = int(result.get("width") or image.shape[1])
-    stored_height = int(result.get("height") or image.shape[0])
-    scale_x = image.shape[1] / stored_width if stored_width else 1.0
-    scale_y = image.shape[0] / stored_height if stored_height else 1.0
-    x, y, w, h = result["bbox"]
-    draw_label_box(
-        image,
-        int(x * scale_x),
-        int(y * scale_y),
-        int(w * scale_x),
-        int(h * scale_y),
-        f"%{result['score'] * 100:.0f}",
-    )
-    return bgr_to_rgb(image)
+@st.cache_data(ttl=1800, max_entries=48, show_spinner=False)
+def get_download_file(
+    file_id: str,
+    api_key: str,
+    credentials_identity: str,
+    resource_key: str | None,
+) -> tuple[bytes, str] | None:
+    client = get_drive_client_cached(api_key, credentials_identity)
+    return client.fetch_file_bytes(file_id, resource_key)
+
+
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
+def get_folder_meta_cached(
+    folder_id: str,
+    api_key: str,
+    credentials_identity: str,
+) -> dict:
+    client = get_drive_client_cached(api_key, credentials_identity)
+    return client.get_folder_meta(folder_id)
+
+
+@st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
+def get_folder_count_cached(
+    folder_id: str,
+    resource_key: str | None,
+    api_key: str,
+    credentials_identity: str,
+) -> int:
+    client = get_drive_client_cached(api_key, credentials_identity)
+    try:
+        return client.count_images(folder_id, resource_key, True)
+    except Exception:
+        return -1
+
+
+@st.cache_data(ttl=3600, max_entries=256, show_spinner=False)
+def resolve_folder_meta_cached(
+    file_id: str,
+    depth: int,
+    api_key: str,
+    credentials_identity: str,
+) -> dict:
+    client = get_drive_client_cached(api_key, credentials_identity)
+    try:
+        return client.resolve_folder_from_file(file_id, depth)
+    except Exception:
+        return {}
+
+
+def _format_drive_date(value: str) -> str:
+    if not value:
+        return ""
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    return parsed.astimezone(timezone.utc).strftime("%d.%m.%Y")
+
+
+def list_saved_folders() -> list[dict]:
+    """Daha önce eklenmiş (taranmış) klasörleri Drive tarihine göre sıralı döndürür."""
+    from core.config import INDEX_DIR
+
+    if not INDEX_DIR.exists():
+        return []
+
+    folders: list[dict] = []
+    for path in sorted(INDEX_DIR.glob("*.sqlite")):
+        store = None
+        try:
+            store = IndexStore(path)
+            stats = store.stats()
+            image_count = int(stats.get("images") or 0)
+            if image_count <= 0:
+                continue
+
+            hidden_flag = store.meta_get("folder_hidden")
+            if hidden_flag is None:
+                store.set_meta("folder_hidden", "0")
+                hidden_flag = "0"
+            if hidden_flag == "1":
+                continue
+
+            folder_url = store.meta_get("folder_url") or ""
+            folder_id_meta = store.meta_get("folder_id") or ""
+            title = store.meta_get("folder_title") or ""
+            drive_date = store.meta_get("folder_date") or ""
+            added_at = store.meta_get("added_at") or ""
+            folder_count_meta = store.meta_get("folder_count") or ""
+
+            folder_id = folder_id_meta or None
+            resource_key = None
+            if not folder_id and folder_url:
+                try:
+                    folder_id, resource_key = parse_drive_folder_url(folder_url)
+                except DriveError:
+                    folder_id = None
+
+            if not folder_id:
+                sample = store.sample_image()
+                if sample is not None:
+                    sample_id, sample_path = sample
+                    resolved = resolve_folder_meta_cached(
+                        sample_id,
+                        sample_path.count(" / "),
+                        api_key,
+                        credentials_identity,
+                    )
+                    resolved_id = resolved.get("id")
+                    if resolved_id:
+                        folder_id = resolved_id
+                        folder_url = folder_url or (
+                            "https://drive.google.com/drive/folders/"
+                            f"{resolved_id}"
+                        )
+                        store.set_meta("folder_id", resolved_id)
+                        store.set_meta("folder_url", folder_url)
+                        if resolved.get("name"):
+                            title = title or resolved["name"]
+                            store.set_meta("folder_title", resolved["name"])
+                        resolved_date = resolved.get(
+                            "created_time"
+                        ) or resolved.get("modified_time")
+                        if resolved_date:
+                            drive_date = drive_date or resolved_date
+                            store.set_meta("folder_date", resolved_date)
+
+            if folder_id and (not title or not drive_date):
+                try:
+                    meta = get_folder_meta_cached(
+                        folder_id, api_key, credentials_identity
+                    )
+                except Exception:
+                    meta = {}
+                title = title or meta.get("name") or ""
+                drive_date = (
+                    drive_date
+                    or meta.get("created_time")
+                    or meta.get("modified_time")
+                    or ""
+                )
+
+            count = int(folder_count_meta) if folder_count_meta.isdigit() else 0
+            if not count and folder_id:
+                drive_count = get_folder_count_cached(
+                    folder_id, resource_key, api_key, credentials_identity
+                )
+                if drive_count >= 0:
+                    count = drive_count
+                    store.set_meta("folder_count", str(drive_count))
+            if not count:
+                count = image_count
+
+            folders.append(
+                {
+                    "key": path.stem,
+                    "url": folder_url,
+                    "folder_id": folder_id,
+                    "linked": bool(folder_id),
+                    "title": title or folder_url or f"Klasör {path.stem[:8]}",
+                    "count": count,
+                    "indexed": image_count,
+                    "date": drive_date or added_at,
+                    "date_label": _format_drive_date(drive_date or added_at),
+                }
+            )
+        except Exception:
+            continue
+        finally:
+            if store is not None:
+                try:
+                    store.close()
+                except Exception:
+                    pass
+
+    folders.sort(key=lambda item: item["date"], reverse=True)
+    return folders
 
 
 service_account_info = get_service_account_info()
@@ -510,6 +686,26 @@ def run_indexing() -> None:
         )
 
         store.set_meta("folder_url", folder_url.strip())
+        store.set_meta("folder_id", folder_id)
+        store.set_meta("folder_hidden", "1" if hide_folder else "0")
+        store.set_meta("folder_count", str(summary["total_found"]))
+        store.set_meta(
+            "added_at",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        try:
+            folder_meta = get_folder_meta_cached(
+                folder_id, api_key, credentials_identity
+            )
+        except Exception:
+            folder_meta = {}
+        if folder_meta.get("name"):
+            store.set_meta("folder_title", folder_meta["name"])
+        drive_date = folder_meta.get("created_time") or folder_meta.get(
+            "modified_time"
+        )
+        if drive_date:
+            store.set_meta("folder_date", drive_date)
         progress.progress(1.0, text="Bitti")
 
         counters = summary["counters"]
@@ -556,8 +752,8 @@ st.markdown(
         <div class="kicker">{APP_TITLE}</div>
       </div>
       <h1>Fotoğrafta<br>kendini bul.</h1>
-      <p>Drive klasörünü tara, yüzünü yükle, eşleşen fotoğrafları gör.
-      Kayıt olman gerekmez.</p>
+      <p>Klasörünü ekle ya da kayıtlı klasörlerden seç, yüzünü yükle,
+      eşleşen fotoğrafları gör.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -568,15 +764,65 @@ show_flash()
 step_header(
     "01",
     "Fotoğrafların olduğu klasör",
-    "Drive klasörünün linkini yapıştır. Klasör herkese açık olmalı.",
+    "Daha önce eklediğin bir klasörü seç ya da yeni bir Drive klasör "
+    "linki yapıştır. Yeni bir yükleme ise gizli tutmayı işaretleyebilirsin.",
+    "Klasör Drive'da 'Bağlantıya sahip herkes' olarak paylaşılmış olmalı.",
 )
 
-folder_url = st.text_input(
-    "Drive klasör linki",
-    key="folder_url",
-    placeholder="https://drive.google.com/drive/folders/...",
-    label_visibility="collapsed",
-)
+
+def select_saved_folder(item_key: str, url: str) -> None:
+    st.session_state["active_folder_key"] = item_key
+    st.session_state["folder_url"] = url or ""
+
+
+saved_folders = list_saved_folders()
+
+folder_mode = "Yeni klasör linki"
+if saved_folders:
+    folder_mode = st.radio(
+        "Klasör seçimi",
+        ["Yeni klasör linki", "Mevcut ekli klasörler"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="folder_mode",
+    )
+
+selected_saved_key: str | None = None
+folder_url = ""
+
+if folder_mode == "Mevcut ekli klasörler":
+    st.caption(f"{len(saved_folders)} klasör kayıtlı · en yeni yükleme üstte")
+    selected_saved_key = st.session_state.get("active_folder_key")
+
+    for item in saved_folders:
+        is_active = item["key"] == selected_saved_key
+        with st.container(border=True):
+            info_col, action_col = st.columns([4, 1.2])
+            with info_col:
+                st.markdown(f"**{item['title']}**")
+                meta_bits = [f"{item['count']} fotoğraf"]
+                if item["linked"] and item["indexed"] != item["count"]:
+                    meta_bits.append(f"{item['indexed']} taranmış")
+                if item["date_label"]:
+                    meta_bits.append(f"Drive yükleme: {item['date_label']}")
+                st.caption(" · ".join(meta_bits))
+            with action_col:
+                st.button(
+                    "Seçili" if is_active else "Bu klasörü seç",
+                    key=f"pick_{item['key']}",
+                    width="stretch",
+                    disabled=is_active,
+                    on_click=select_saved_folder,
+                    args=(item["key"], item["url"]),
+                )
+    folder_url = st.session_state.get("folder_url", "")
+else:
+    folder_url = st.text_input(
+        "Drive klasör linki",
+        key="folder_url",
+        placeholder="https://drive.google.com/drive/folders/...",
+        label_visibility="collapsed",
+    )
 
 folder_id: str | None = None
 resource_key: str | None = None
@@ -594,20 +840,60 @@ min_face = DEFAULT_MIN_FACE
 max_faces = DEFAULT_MAX_FACES
 max_images = 0
 force_reindex = False
+hide_folder = False
 
 key: str | None = None
 store: IndexStore | None = None
-if folder_id:
+if selected_saved_key:
+    key = selected_saved_key
+    store = get_store_cached(key)
+elif folder_id:
     key = folder_key(folder_id, resource_key, include_subfolders, thumb_size)
     store = get_store_cached(key)
+
+if folder_id and store is not None:
+    if not store.meta_get("folder_title") or not store.meta_get("folder_url"):
+        try:
+            entered_meta = get_folder_meta_cached(
+                folder_id, api_key, credentials_identity
+            )
+        except Exception:
+            entered_meta = {}
+        if entered_meta.get("name"):
+            store.set_meta("folder_title", entered_meta["name"])
+        entered_date = entered_meta.get("created_time") or entered_meta.get(
+            "modified_time"
+        )
+        if entered_date:
+            store.set_meta("folder_date", entered_date)
+        store.set_meta("folder_url", folder_url.strip())
+        store.set_meta("folder_id", folder_id)
 
 if folder_error:
     st.caption(
         "Klasör linki okunamadı. Drive'da klasörü açıp adres çubuğundaki "
         "linki kopyala."
     )
+elif selected_saved_key:
+    st.caption("Seçili klasör hazır. Sonuçlar 02'de yüz yükleyince görünür.")
+elif folder_id:
+    st.caption(
+        "İlk tarama fotoğraf sayısına göre birkaç dakika sürebilir. "
+        "Eklediğin klasörler 'Mevcut ekli klasörler' listesinde birikir."
+    )
 else:
-    st.caption("İlk tarama, fotoğraf sayısına göre birkaç dakika sürebilir.")
+    st.caption("Bir klasör seç ya da yeni bir Drive klasör linki yapıştır.")
+
+if folder_id and not folder_error:
+    hide_folder = st.checkbox(
+        "Bu klasörü gizli tut",
+        key=f"hide_folder_{folder_id}",
+        help=(
+            "Yeni bir yükleme ise işaretle: bu klasör 'Mevcut ekli "
+            "klasörler' listesinde görünmez. Gizli klasörleri yalnızca "
+            "linki tekrar girerek açabilirsin."
+        ),
+    )
 
 scan_clicked = st.button(
     "Taramayı başlat",
@@ -641,6 +927,7 @@ step_header(
     "02",
     "Yüzünü yükle",
     "Net, önden çekilmiş bir fotoğraf seç veya kamerayla anlık çek.",
+    "Seçilen resimler hiçbir yere gönderilmez; yalnızca taranan fotoğraflarla karşılaştırılır.",
 )
 
 face_input = st.radio(
@@ -707,7 +994,7 @@ step_header(
 )
 
 if store is None:
-    st.caption("Önce 01'de bir klasör linki gir.")
+    st.caption("Önce 01'de bir klasör seç veya Drive klasör linki gir.")
 elif face_file is None:
     st.caption("Yüz fotoğrafını yükleyince veya çekince sonuçlar burada görünür.")
 elif probe_embedding is None:
@@ -760,7 +1047,7 @@ else:
                         )
                         if image_bgr is not None:
                             st.image(
-                                annotate_result(image_bgr, result),
+                                bgr_to_rgb(image_bgr),
                                 width="stretch",
                             )
                         else:
@@ -771,6 +1058,24 @@ else:
 
                         st.markdown(f"**%{result['score'] * 100:.0f} eşleşme**")
                         st.caption(result["name"])
+
+                        download_file = get_download_file(
+                            result["file_id"],
+                            api_key,
+                            credentials_identity,
+                            resource_key,
+                        )
+                        if download_file is not None:
+                            download_bytes, download_mime = download_file
+                            st.download_button(
+                                "Fotoğrafı indir",
+                                download_bytes,
+                                file_name=result["name"],
+                                mime=download_mime,
+                                width="stretch",
+                                key=f"download_{result['file_id']}",
+                            )
+
                         st.link_button(
                             "Drive'da aç",
                             drive_view_url(result["file_id"]),
@@ -782,6 +1087,10 @@ rule()
 with st.expander("Nasıl çalışır?"):
     st.markdown(
         """
+        - Eklediğin klasörler kaydedilir; sonraki girişlerde listeden seçebilirsin.
+        - Klasörler Drive'daki yükleme tarihine göre, en yeni üstte sıralanır.
+        - 'Gizli tut' işaretlenen yeni yüklemeler listede görünmez.
+        - Daha önce eklenmiş tüm klasörler varsayılan olarak herkese açıktır.
         - Klasördeki fotoğrafların küçük önizlemeleri alınır.
         - Yüzler burada işlenir ve birbirleriyle karşılaştırılır.
         - Üçüncü taraf yüz tanıma servisi kullanılmaz.
