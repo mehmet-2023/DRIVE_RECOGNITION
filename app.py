@@ -9,6 +9,14 @@ from datetime import datetime, timezone
 import numpy as np
 import streamlit as st
 
+try:
+    from starlette.requests import ClientDisconnect as _ClientDisconnect  # type: ignore
+except ImportError:
+    _ClientDisconnect = None  # type: ignore
+
+# Yakalanacak istisna sınıfları—ClientDisconnect yoksa sadece boş tuple
+_DISCONNECT_EXC = (_ClientDisconnect,) if _ClientDisconnect is not None else ()
+
 st.set_page_config(
     page_title="Drive Yüz Tanıma",
     page_icon="⬛",
@@ -1026,17 +1034,29 @@ probe_embedding: np.ndarray | None = None
 if face_file is not None:
     upload_result = None
     try:
-        with st.spinner("Yüz aranıyor..."):
-            upload_result = analyze_upload_cached(
-                face_file.getvalue(),
-                det_threshold,
-                min_face,
-            )
+        file_bytes = face_file.getvalue()
+    except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
+        # Kullanıcı yükleme sırasında bağlantıyı kesti — sessizce çık
+        file_bytes = None
     except Exception:
-        st.error(
-            "Yüz modeli yüklenemedi. İnternet bağlantısını kontrol edip "
-            "tekrar dene."
-        )
+        file_bytes = None
+
+    if file_bytes:
+        try:
+            with st.spinner("Yüz aranıyor..."):
+                upload_result = analyze_upload_cached(
+                    file_bytes,
+                    det_threshold,
+                    min_face,
+                )
+        except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
+            # Yükleme iptal edildi, uygulama devam eder
+            upload_result = None
+        except Exception:
+            st.error(
+                "Yüz modeli yüklenemedi. İnternet bağlantısını kontrol edip "
+                "tekrar dene."
+            )
 
     if upload_result is not None:
         if upload_result.get("error"):
