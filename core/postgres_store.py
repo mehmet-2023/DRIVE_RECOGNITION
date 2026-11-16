@@ -14,6 +14,26 @@ class PostgresError(Exception):
     """Supabase/Postgres bağlantı ve sorgu hataları."""
 
 
+_DISCONNECT_HINTS = (
+    "server closed the connection unexpectedly",
+    "connection already closed",
+    "ssl connection has been closed",
+    "terminating connection",
+    "connection reset by peer",
+    "could not receive data from server",
+    "connection not open",
+    "broken pipe",
+)
+
+
+def _is_disconnect(exc: Exception) -> bool:
+    """Bağlantı kopması kaynaklı hataları ayırt eder (yeniden bağlanıp denenir)."""
+    if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+        return True
+    text = str(exc).lower()
+    return any(hint in text for hint in _DISCONNECT_HINTS)
+
+
 def _friendly_error(exc: Exception) -> str:
     text = str(exc).strip() or exc.__class__.__name__
     lowered = text.lower()
@@ -135,21 +155,36 @@ class PostgresStore:
         conn.commit()
         self._schema_ready = True
 
+    def _discard_connection(self) -> None:
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _run(self, operation):
         with self._lock:
-            try:
-                conn = self._connect_locked()
-                self._ensure_schema_locked(conn)
-                result = operation(conn)
-                conn.commit()
-                return result
-            except psycopg2.Error as exc:
-                if self._conn is not None and not self._conn.closed:
+            for attempt in range(2):
+                try:
+                    conn = self._connect_locked()
+                    self._ensure_schema_locked(conn)
+                    result = operation(conn)
+                    conn.commit()
+                    return result
+                except psycopg2.Error as exc:
                     try:
-                        self._conn.rollback()
+                        if self._conn is not None and not self._conn.closed:
+                            self._conn.rollback()
                     except Exception:
                         pass
-                raise PostgresError(_friendly_error(exc)) from exc
+                    self._discard_connection()
+                    # Boşta kalan bağlantıyı pooler kapatmış olabilir:
+                    # bir kez taze bağlantıyla tekrar dene.
+                    if attempt == 0 and _is_disconnect(exc):
+                        continue
+                    raise PostgresError(_friendly_error(exc)) from exc
 
     def ping(self) -> bool:
         def operation(conn):

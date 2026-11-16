@@ -834,24 +834,32 @@ elif folder_id:
     store = get_store_cached(key)
 
 if folder_id and store is not None:
-    if (not store.meta_get("folder_title") or not store.meta_get("folder_url")) and (
-        store.stats().get("images", 0) > 0
-    ):
+    try:
+        needs_meta = (
+            not store.meta_get("folder_title") or not store.meta_get("folder_url")
+        ) and store.stats().get("images", 0) > 0
+    except Exception:
+        needs_meta = False
+
+    if needs_meta:
         try:
             entered_meta = get_folder_meta_cached(
                 folder_id, api_key, credentials_identity
             )
         except Exception:
             entered_meta = {}
-        if entered_meta.get("name"):
-            store.set_meta("folder_title", entered_meta["name"])
-        entered_date = entered_meta.get("created_time") or entered_meta.get(
-            "modified_time"
-        )
-        if entered_date:
-            store.set_meta("folder_date", entered_date)
-        store.set_meta("folder_url", folder_url.strip())
-        store.set_meta("folder_id", folder_id)
+        try:
+            if entered_meta.get("name"):
+                store.set_meta("folder_title", entered_meta["name"])
+            entered_date = entered_meta.get("created_time") or entered_meta.get(
+                "modified_time"
+            )
+            if entered_date:
+                store.set_meta("folder_date", entered_date)
+            store.set_meta("folder_url", folder_url.strip())
+            store.set_meta("folder_id", folder_id)
+        except Exception:
+            pass
 
 if folder_error:
     st.caption(
@@ -991,7 +999,14 @@ elif probe_embedding is None:
     st.caption("Yüz bulunamadı. Daha net bir fotoğraf yükle veya çek.")
 else:
     with st.spinner("Sonuçlar hazırlanıyor..."):
-        matrix, metas = store.load_matrix()
+        try:
+            matrix, metas = store.load_matrix()
+        except Exception:
+            st.error(
+                "Kayıtlı indeks okunamadı. Supabase bağlantısını kontrol edip "
+                "sayfayı yenile."
+            )
+            st.stop()
 
     if matrix.shape[0] == 0:
         st.caption("Bu klasörde henüz yüz yok. Önce 01'deki taramayı başlat.")
@@ -1026,13 +1041,16 @@ else:
             for result_index, result in enumerate(results):
                 with columns[result_index % 3]:
                     with st.container(border=True):
-                        image_bgr = get_display_image(
-                            result["file_id"],
-                            thumb_size,
-                            api_key,
-                            credentials_identity,
-                            resource_key,
-                        )
+                        try:
+                            image_bgr = get_display_image(
+                                result["file_id"],
+                                thumb_size,
+                                api_key,
+                                credentials_identity,
+                                resource_key,
+                            )
+                        except Exception:
+                            image_bgr = None
                         if image_bgr is not None:
                             st.image(
                                 bgr_to_rgb(image_bgr),
@@ -1047,12 +1065,15 @@ else:
                         st.markdown(f"**%{result['score'] * 100:.0f} eşleşme**")
                         st.caption(result["name"])
 
-                        download_file = get_download_file(
-                            result["file_id"],
-                            api_key,
-                            credentials_identity,
-                            resource_key,
-                        )
+                        try:
+                            download_file = get_download_file(
+                                result["file_id"],
+                                api_key,
+                                credentials_identity,
+                                resource_key,
+                            )
+                        except Exception:
+                            download_file = None
                         if download_file is not None:
                             download_bytes, download_mime = download_file
                             st.download_button(

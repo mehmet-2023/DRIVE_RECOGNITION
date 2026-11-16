@@ -16,6 +16,9 @@ venv/
 .idea/
 .vscode/
 
+# Local dev tooling
+indexer.py
+
 # Local indexes and exports
 *.sqlite
 *.sqlite-wal
