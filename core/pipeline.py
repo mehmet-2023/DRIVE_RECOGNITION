@@ -8,9 +8,10 @@ from typing import Callable
 
 import numpy as np
 
+from .config import EMBEDDING_SIZE
 from .drive import DriveClient, DriveItem
 from .face_engine import FaceEngine
-from .index_store import EMBEDDING_SIZE, IndexStore
+from .pg_index_store import PgIndexStore
 
 
 @dataclass(slots=True)
@@ -73,7 +74,7 @@ def encode_row(
 def build_index(
     client: DriveClient,
     engine: FaceEngine,
-    store: IndexStore,
+    store: PgIndexStore,
     folder_id: str,
     resource_key: str | None,
     options: IndexOptions,

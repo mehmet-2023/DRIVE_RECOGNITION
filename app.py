@@ -31,7 +31,7 @@ from core.config import (  # noqa: E402
 from core.drive import DriveClient, DriveError, parse_drive_folder_url  # noqa: E402
 from core.face_engine import FaceEngine, ensure_models  # noqa: E402
 from core.image_utils import bgr_to_rgb, decode_image_bytes  # noqa: E402
-from core.index_store import IndexStore  # noqa: E402
+from core.pg_index_store import PgIndexStore  # noqa: E402
 from core.pipeline import IndexOptions, build_index, search_embeddings  # noqa: E402
 from core.postgres_store import PostgresError, PostgresStore  # noqa: E402
 
@@ -345,10 +345,10 @@ def get_drive_client_cached(api_key: str, credentials_identity: str) -> DriveCli
 
 
 @st.cache_resource(show_spinner=False)
-def get_store_cached(key: str) -> IndexStore:
-    from core.config import INDEX_DIR
-
-    return IndexStore(INDEX_DIR / f"{key}.sqlite")
+def get_store_cached(key: str) -> PgIndexStore:
+    if pg is None:
+        raise PostgresError("Supabase bağlantısı kurulamadı.")
+    return PgIndexStore(pg, key)
 
 
 @st.cache_resource(show_spinner=False)
@@ -452,35 +452,39 @@ def _format_drive_date(value: str) -> str:
 
 
 def list_saved_folders() -> list[dict]:
-    """Daha önce eklenmiş (taranmış) klasörleri Drive tarihine göre sıralı döndürür."""
-    from core.config import INDEX_DIR
+    """Daha önce eklenmiş klasörleri Supabase'ten Drive tarihine göre sıralı döndürür."""
+    if pg is None:
+        return []
 
-    if not INDEX_DIR.exists():
+    try:
+        rows = pg.list_folders()
+    except Exception:
         return []
 
     folders: list[dict] = []
-    for path in sorted(INDEX_DIR.glob("*.sqlite")):
-        store = None
+    for row in rows:
+        key = str(row.get("folder_key") or "")
+        meta = row.get("meta") or {}
+        if not key:
+            continue
         try:
-            store = IndexStore(path)
-            stats = store.stats()
-            image_count = int(stats.get("images") or 0)
-
-            hidden_flag = store.meta_get("folder_hidden")
+            hidden_flag = meta.get("folder_hidden")
             if hidden_flag is None:
-                store.set_meta("folder_hidden", "0")
+                pg.set_folder_meta(key, "folder_hidden", "0")
                 hidden_flag = "0"
-            if hidden_flag == "1":
+            if str(hidden_flag) == "1":
                 continue
 
-            folder_url = store.meta_get("folder_url") or ""
-            folder_id_meta = store.meta_get("folder_id") or ""
-            title = store.meta_get("folder_title") or ""
-            drive_date = store.meta_get("folder_date") or ""
-            added_at = store.meta_get("added_at") or ""
-            folder_count_meta = store.meta_get("folder_count") or ""
+            store = PgIndexStore(pg, key)
+            image_count = int(store.stats().get("images") or 0)
 
-            folder_id = folder_id_meta or None
+            folder_url = str(meta.get("folder_url") or "")
+            folder_id = str(meta.get("folder_id") or "") or None
+            title = str(meta.get("folder_title") or "")
+            drive_date = str(meta.get("folder_date") or "")
+            added_at = str(meta.get("added_at") or "")
+            folder_count_meta = str(meta.get("folder_count") or "")
+
             resource_key = None
             if not folder_id and folder_url:
                 try:
@@ -519,16 +523,16 @@ def list_saved_folders() -> list[dict]:
 
             if folder_id and (not title or not drive_date):
                 try:
-                    meta = get_folder_meta_cached(
+                    drive_meta = get_folder_meta_cached(
                         folder_id, api_key, credentials_identity
                     )
                 except Exception:
-                    meta = {}
-                title = title or meta.get("name") or ""
+                    drive_meta = {}
+                title = title or drive_meta.get("name") or ""
                 drive_date = (
                     drive_date
-                    or meta.get("created_time")
-                    or meta.get("modified_time")
+                    or drive_meta.get("created_time")
+                    or drive_meta.get("modified_time")
                     or ""
                 )
 
@@ -548,11 +552,11 @@ def list_saved_folders() -> list[dict]:
 
             folders.append(
                 {
-                    "key": path.stem,
+                    "key": key,
                     "url": folder_url,
                     "folder_id": folder_id,
                     "linked": bool(folder_id),
-                    "title": title or f"Klasör {path.stem[:8]}",
+                    "title": title or f"Klasör {key[:8]}",
                     "count": count,
                     "indexed": image_count,
                     "date": drive_date or added_at,
@@ -561,12 +565,6 @@ def list_saved_folders() -> list[dict]:
             )
         except Exception:
             continue
-        finally:
-            if store is not None:
-                try:
-                    store.close()
-                except Exception:
-                    pass
 
     folders.sort(key=lambda item: item["date"], reverse=True)
     return folders
@@ -592,35 +590,12 @@ if supabase_config:
     except Exception:
         pg = None
 
-
-def ensure_remote_loaded(
-    target_store: IndexStore | None,
-    postgres: PostgresStore | None,
-    target_key: str | None,
-    *,
-    force: bool = False,
-) -> int:
-    if target_store is None or postgres is None or not target_key:
-        return 0
-
-    loaded_flag = f"_remote_loaded_{target_key}"
-    if not force and st.session_state.get(loaded_flag):
-        return 0
-    local_stats = target_store.stats()
-    if not force and (local_stats["done"] + local_stats["no_face"]) > 0:
-        st.session_state[loaded_flag] = True
-        return 0
-
-    try:
-        rows = postgres.fetch(target_key)
-    except Exception:
-        st.session_state[loaded_flag] = True
-        return 0
-
-    if rows:
-        target_store.import_rows(rows)
-    st.session_state[loaded_flag] = True
-    return len(rows)
+if pg is None:
+    st.error(
+        "Supabase bağlantısı kurulamadı. Uygulama tüm verileri Supabase'te "
+        "tutuyor; SUPABASE_DB_URL ayarını kontrol edip tekrar dene."
+    )
+    st.stop()
 
 
 def run_indexing() -> None:
@@ -636,15 +611,6 @@ def run_indexing() -> None:
         with st.spinner("Hazırlanıyor..."):
             engine = get_engine_cached()
 
-        postgres_ready = False
-        if pg is not None:
-            try:
-                pg.ping()
-                postgres_ready = True
-                ensure_remote_loaded(store, pg, key)
-            except Exception:
-                postgres_ready = False
-
         def on_status(message: str) -> None:
             status_box.caption(message)
 
@@ -654,10 +620,6 @@ def run_indexing() -> None:
                 min(1.0, fraction),
                 text=f"{done}/{total} fotoğraf · {counters['faces']} yüz",
             )
-
-        def on_batch(rows: list[dict]) -> None:
-            if postgres_ready and pg is not None:
-                pg.upsert(key, rows)
 
         summary = build_index(
             client=client,
@@ -678,14 +640,11 @@ def run_indexing() -> None:
             ),
             on_status=on_status,
             on_progress=on_progress,
-            on_batch=on_batch,
-            load_cached=(
-                pg.fetch_existing
-                if postgres_ready and pg is not None
-                else None
-            ),
+            on_batch=lambda _rows: store.flush(),
+            load_cached=pg.fetch_existing if pg is not None else None,
         )
 
+        store.flush()
         store.set_meta("folder_url", folder_url.strip())
         store.set_meta("folder_id", folder_id)
         store.set_meta("folder_hidden", "1" if hide_folder else "0")
@@ -865,7 +824,7 @@ force_reindex = False
 hide_folder = False
 
 key: str | None = None
-store: IndexStore | None = None
+store: PgIndexStore | None = None
 if selected_saved_key:
     key = selected_saved_key
     store = get_store_cached(key)
@@ -1031,9 +990,7 @@ elif probe_embedding is None:
     st.caption("Yüz bulunamadı. Daha net bir fotoğraf yükle veya çek.")
 else:
     with st.spinner("Sonuçlar hazırlanıyor..."):
-        ensure_remote_loaded(store, pg, key)
-
-    matrix, metas = store.load_matrix()
+        matrix, metas = store.load_matrix()
 
     if matrix.shape[0] == 0:
         st.caption("Bu klasörde henüz yüz yok. Önce 01'deki taramayı başlat.")

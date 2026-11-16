@@ -11,8 +11,9 @@ import streamlit as st
 APP_TITLE = "Drive Yüz Tanıma Sistemi"
 APP_BRAND = "BY OCAL"
 
+EMBEDDING_SIZE = 128
+
 MODEL_DIR = Path(os.environ.get("DRIVE_FACE_MODEL_DIR", "/tmp/drive_face_models"))
-INDEX_DIR = Path(os.environ.get("DRIVE_FACE_INDEX_DIR", "/tmp/drive_face_index"))
 
 YUNET_FILE = "face_detection_yunet_2023mar.onnx"
 SFACE_FILE = "face_recognition_sface_2021dec.onnx"

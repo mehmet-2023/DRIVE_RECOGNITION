@@ -100,14 +100,36 @@ class PostgresStore:
                     error TEXT,
                     faces JSONB NOT NULL DEFAULT '[]'::jsonb,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    claimed_at TIMESTAMPTZ,
                     PRIMARY KEY (folder_key, file_id)
                 )
                 """
             )
             cursor.execute(
                 f"""
+                ALTER TABLE {self.table}
+                ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ
+                """
+            )
+            cursor.execute(
+                f"""
                 CREATE INDEX IF NOT EXISTS {self.table}_folder_key_idx
                 ON {self.table} (folder_key)
+                """
+            )
+            cursor.execute(
+                f"""
+                CREATE INDEX IF NOT EXISTS {self.table}_file_id_idx
+                ON {self.table} (file_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS drive_folders (
+                    folder_key TEXT PRIMARY KEY,
+                    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
                 """
             )
         conn.commit()
@@ -282,6 +304,224 @@ class PostgresStore:
                 return cursor.rowcount or 0
 
         return int(self._run(operation))
+
+    # ------------------------------------------------------------- folder meta
+
+    def set_folder_meta(self, folder_key: str, key: str, value: str) -> None:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO drive_folders (folder_key, meta, updated_at)
+                    VALUES (%s, jsonb_build_object(%s, %s::text), now())
+                    ON CONFLICT (folder_key) DO UPDATE SET
+                        meta = drive_folders.meta
+                               || jsonb_build_object(%s, %s::text),
+                        updated_at = now()
+                    """,
+                    (folder_key, key, value, key, value),
+                )
+
+        self._run(operation)
+
+    def get_folder_meta(
+        self, folder_key: str, key: str, default: str | None = None
+    ) -> str | None:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT meta ->> %s FROM drive_folders WHERE folder_key = %s",
+                    (key, folder_key),
+                )
+                row = cursor.fetchone()
+                if row is None or row[0] is None:
+                    return default
+                return str(row[0])
+
+        return self._run(operation)
+
+    def list_folders(self) -> list[dict]:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT folder_key, meta FROM drive_folders")
+                output: list[dict] = []
+                for folder_key, meta in cursor.fetchall():
+                    if isinstance(meta, str):
+                        try:
+                            meta = json.loads(meta)
+                        except ValueError:
+                            meta = {}
+                    output.append(
+                        {"folder_key": str(folder_key), "meta": meta or {}}
+                    )
+                return output
+
+        return self._run(operation)
+
+    def delete_folder_meta(self, folder_key: str) -> None:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM drive_folders WHERE folder_key = %s",
+                    (folder_key,),
+                )
+
+        self._run(operation)
+
+    def folder_stats(self, folder_key: str) -> dict:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT
+                        COUNT(*),
+                        COUNT(*) FILTER (WHERE status = 'done'),
+                        COUNT(*) FILTER (WHERE status = 'no_face'),
+                        COUNT(*) FILTER (WHERE status = 'error'),
+                        COALESCE(SUM(jsonb_array_length(faces)), 0)
+                    FROM {self.table}
+                    WHERE folder_key = %s
+                    """,
+                    (folder_key,),
+                )
+                total, done, no_face, errors, faces = cursor.fetchone()
+                return {
+                    "images": int(total or 0),
+                    "done": int(done or 0),
+                    "no_face": int(no_face or 0),
+                    "errors": int(errors or 0),
+                    "faces": int(faces or 0),
+                }
+
+        return self._run(operation)
+
+    def sample_image(self, folder_key: str) -> tuple[str, str] | None:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT file_id, path FROM {self.table}
+                    WHERE folder_key = %s AND path IS NOT NULL AND path <> ''
+                    ORDER BY LENGTH(path) ASC LIMIT 1
+                    """,
+                    (folder_key,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return str(row[0]), str(row[1] or "")
+
+        return self._run(operation)
+
+    def has_image(self, folder_key: str, file_id: str) -> bool:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT 1 FROM {self.table}
+                    WHERE folder_key = %s AND file_id = %s LIMIT 1
+                    """,
+                    (folder_key, file_id),
+                )
+                return cursor.fetchone() is not None
+
+        return bool(self._run(operation))
+
+    def done_ids(self, folder_key: str) -> set[str]:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT file_id FROM {self.table}
+                    WHERE folder_key = %s AND status IN ('done', 'no_face')
+                    """,
+                    (folder_key,),
+                )
+                return {str(row[0]) for row in cursor.fetchall()}
+
+        return self._run(operation)
+
+    def claim_images(
+        self,
+        folder_key: str,
+        file_ids: list[str],
+        *,
+        force: bool = False,
+        stale_minutes: int = 30,
+    ) -> set[str]:
+        if not file_ids:
+            return set()
+        stale = max(1, int(stale_minutes))
+
+        def operation(conn):
+            claimed: set[str] = set()
+            with conn.cursor() as cursor:
+                for file_id in file_ids:
+                    cursor.execute(
+                        f"""
+                        INSERT INTO {self.table}
+                            (folder_key, file_id, name, path, status,
+                             updated_at, claimed_at)
+                        VALUES (%s, %s, '', '', 'processing', now(), now())
+                        ON CONFLICT (folder_key, file_id) DO NOTHING
+                        """,
+                        (folder_key, file_id),
+                    )
+                    if cursor.rowcount:
+                        claimed.add(file_id)
+                        continue
+
+                    if force:
+                        cursor.execute(
+                            f"""
+                            UPDATE {self.table}
+                            SET claimed_at = now(),
+                                status = CASE
+                                    WHEN status IN ('done', 'no_face')
+                                    THEN status
+                                    ELSE 'processing'
+                                END
+                            WHERE folder_key = %s AND file_id = %s
+                              AND (claimed_at IS NULL
+                                   OR claimed_at < now()
+                                      - interval '{stale} minutes')
+                            """,
+                            (folder_key, file_id),
+                        )
+                    else:
+                        cursor.execute(
+                            f"""
+                            UPDATE {self.table}
+                            SET status = 'processing',
+                                updated_at = now(),
+                                claimed_at = now()
+                            WHERE folder_key = %s AND file_id = %s
+                              AND status NOT IN ('done', 'no_face')
+                              AND (claimed_at IS NULL
+                                   OR claimed_at < now()
+                                      - interval '{stale} minutes')
+                            """,
+                            (folder_key, file_id),
+                        )
+                    if cursor.rowcount:
+                        claimed.add(file_id)
+            return claimed
+
+        return self._run(operation)
+
+    def clear_folder(self, folder_key: str) -> None:
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"DELETE FROM {self.table} WHERE folder_key = %s",
+                    (folder_key,),
+                )
+                cursor.execute(
+                    "DELETE FROM drive_folders WHERE folder_key = %s",
+                    (folder_key,),
+                )
+
+        self._run(operation)
 
     def close(self) -> None:
         with self._lock:
