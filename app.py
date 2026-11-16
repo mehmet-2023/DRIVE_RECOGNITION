@@ -691,6 +691,8 @@ def run_indexing() -> None:
                 text=f"{done}/{total} fotoğraf · {counters['faces']} yüz",
             )
 
+        scanned_folders: list[str] = []
+
         summary = build_index(
             client=client,
             engine=engine,
@@ -712,10 +714,16 @@ def run_indexing() -> None:
             on_progress=on_progress,
             on_batch=lambda _rows: store.flush(),
             load_cached=pg.fetch_existing if pg is not None else None,
+            on_folder=scanned_folders.append,
         )
 
         store.flush()
         store.set_meta("folder_count", str(summary["total_found"]))
+        if pg is not None and scanned_folders:
+            try:
+                pg.register_indexed_folders(scanned_folders, key)
+            except Exception:
+                pass
         progress.progress(1.0, text="Bitti")
 
         counters = summary["counters"]
@@ -960,7 +968,21 @@ if has_index:
         disabled=indexing_locked,
     )
 
-if scan_clicked or rescan_clicked:
+already_indexed = False
+if scan_clicked and selected_saved_key is None and folder_id and pg is not None:
+    try:
+        already_indexed = pg.is_indexed_folder(folder_id)
+    except Exception:
+        already_indexed = False
+
+if already_indexed:
+    st.warning(
+        "Bu klasör, daha önce indekslenmiş bir klasörün alt klasörü. "
+        "Fotoğrafları zaten kayıtlı olduğu için tekrar indekslenmez. "
+        "Üst klasörü 'Mevcut ekli klasörler' listesinden açıp 'Güncelle' "
+        "ile yenileyebilirsin."
+    )
+elif scan_clicked or rescan_clicked:
     st.session_state["_pending_force"] = rescan_clicked
     st.rerun()
 

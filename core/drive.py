@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 import requests
@@ -491,6 +491,7 @@ class DriveClient:
         resource_key: str | None = None,
         max_folders: int = 20000,
         max_depth: int = 100,
+        on_folder: "Callable[[str], None] | None" = None,
     ) -> Iterator[DriveItem]:
         stack: list[tuple[str, str, str | None, int]] = [
             (root_folder_id, "", resource_key, 0)
@@ -502,6 +503,8 @@ class DriveClient:
             if folder_id in visited:
                 continue
             visited.add(folder_id)
+            if on_folder is not None:
+                on_folder(folder_id)
 
             if len(visited) > max_folders:
                 self.warnings.append(

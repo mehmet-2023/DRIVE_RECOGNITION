@@ -83,6 +83,7 @@ def build_index(
     on_progress: Callable[[int, int, int, dict], None] | None = None,
     on_batch: Callable[[list[dict]], None] | None = None,
     load_cached: Callable[[list[str]], list[dict]] | None = None,
+    on_folder: Callable[[str], None] | None = None,
 ) -> dict:
     if on_status:
         on_status("Klasör okunuyor...")
@@ -93,6 +94,7 @@ def build_index(
         folder_id,
         include_subfolders=options.include_subfolders,
         resource_key=resource_key,
+        on_folder=on_folder,
     ):
         if item.id in seen:
             continue

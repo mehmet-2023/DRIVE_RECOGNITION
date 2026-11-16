@@ -152,6 +152,21 @@ class PostgresStore:
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS drive_indexed_folders (
+                    folder_id TEXT PRIMARY KEY,
+                    root_key TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS drive_indexed_folders_root_idx
+                ON drive_indexed_folders (root_key)
+                """
+            )
         conn.commit()
         self._schema_ready = True
 
@@ -544,6 +559,45 @@ class PostgresStore:
 
         return self._run(operation)
 
+    def register_indexed_folders(
+        self, folder_ids: list[str], root_key: str
+    ) -> int:
+        ids = [str(folder_id) for folder_id in folder_ids if folder_id]
+        if not ids:
+            return 0
+
+        def operation(conn):
+            with conn.cursor() as cursor:
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO drive_indexed_folders (folder_id, root_key)
+                    VALUES %s
+                    ON CONFLICT (folder_id) DO UPDATE SET
+                        root_key = EXCLUDED.root_key,
+                        updated_at = now()
+                    """,
+                    [(folder_id, root_key) for folder_id in ids],
+                    page_size=500,
+                )
+            return len(ids)
+
+        return int(self._run(operation))
+
+    def is_indexed_folder(self, folder_id: str) -> bool:
+        if not folder_id:
+            return False
+
+        def operation(conn):
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT 1 FROM drive_indexed_folders WHERE folder_id = %s LIMIT 1",
+                    (folder_id,),
+                )
+                return cursor.fetchone() is not None
+
+        return bool(self._run(operation))
+
     def clear_folder(self, folder_key: str) -> None:
         def operation(conn):
             with conn.cursor() as cursor:
@@ -553,6 +607,10 @@ class PostgresStore:
                 )
                 cursor.execute(
                     "DELETE FROM drive_folders WHERE folder_key = %s",
+                    (folder_key,),
+                )
+                cursor.execute(
+                    "DELETE FROM drive_indexed_folders WHERE root_key = %s",
                     (folder_key,),
                 )
 
