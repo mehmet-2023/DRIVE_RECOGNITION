@@ -14,7 +14,6 @@ try:
 except ImportError:
     _ClientDisconnect = None  # type: ignore
 
-# Yakalanacak istisna sınıfları—ClientDisconnect yoksa sadece boş tuple
 _DISCONNECT_EXC = (_ClientDisconnect,) if _ClientDisconnect is not None else ()
 
 st.set_page_config(
