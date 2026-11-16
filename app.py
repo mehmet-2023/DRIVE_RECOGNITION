@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import zipfile
 from datetime import datetime, timezone
 
 import numpy as np
@@ -34,6 +36,8 @@ from core.image_utils import bgr_to_rgb, decode_image_bytes  # noqa: E402
 from core.pg_index_store import PgIndexStore  # noqa: E402
 from core.pipeline import IndexOptions, build_index, search_embeddings  # noqa: E402
 from core.postgres_store import PostgresError, PostgresStore  # noqa: E402
+
+PREVIEW_THUMB_SIZE = 384
 
 st.markdown(
     """
@@ -400,6 +404,36 @@ def get_download_file(
 ) -> tuple[bytes, str] | None:
     client = get_drive_client_cached(api_key, credentials_identity)
     return client.fetch_file_bytes(file_id, resource_key)
+
+
+@st.cache_data(ttl=1800, max_entries=4, show_spinner=False)
+def build_results_zip(
+    entries: tuple[tuple[str, str], ...],
+    api_key: str,
+    credentials_identity: str,
+    resource_key: str | None,
+) -> bytes:
+    buffer = io.BytesIO()
+    used: dict[str, int] = {}
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for file_id, name in entries:
+            try:
+                fetched = get_download_file(
+                    file_id, api_key, credentials_identity, resource_key
+                )
+            except Exception:
+                fetched = None
+            if fetched is None:
+                continue
+            data, _mime = fetched
+            base = (name or file_id).strip() or file_id
+            count = used.get(base, 0)
+            used[base] = count + 1
+            if count:
+                stem, dot, ext = base.rpartition(".")
+                base = f"{stem}_{count}.{ext}" if dot else f"{base}_{count}"
+            archive.writestr(base, data)
+    return buffer.getvalue()
 
 
 @st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
@@ -1036,6 +1070,34 @@ else:
         if not results:
             st.caption("Gelişmiş ayarlardan hassasiyeti düşürmeyi dene.")
         else:
+            if st.button(
+                f"Tümünü indir ({len(results)})",
+                key=f"zip_request_{key}",
+                width="stretch",
+                help="Eşleşen tüm fotoğrafları tek bir ZIP dosyası olarak indir.",
+            ):
+                st.session_state["_zip_request_key"] = key
+
+            if st.session_state.get("_zip_request_key") == key:
+                with st.spinner("Tüm eşleşen fotoğraflar hazırlanıyor..."):
+                    zip_bytes = build_results_zip(
+                        tuple((r["file_id"], r["name"]) for r in results),
+                        api_key,
+                        credentials_identity,
+                        resource_key,
+                    )
+                if zip_bytes:
+                    st.download_button(
+                        "ZIP dosyasını indir",
+                        zip_bytes,
+                        file_name="eslesen_fotograflar.zip",
+                        mime="application/zip",
+                        width="stretch",
+                        key=f"zip_download_{key}",
+                    )
+                else:
+                    st.caption("İndirilecek fotoğraf hazırlanamadı.")
+
             columns = st.columns(3, gap="medium")
 
             for result_index, result in enumerate(results):
@@ -1044,7 +1106,7 @@ else:
                         try:
                             image_bgr = get_display_image(
                                 result["file_id"],
-                                thumb_size,
+                                PREVIEW_THUMB_SIZE,
                                 api_key,
                                 credentials_identity,
                                 resource_key,
