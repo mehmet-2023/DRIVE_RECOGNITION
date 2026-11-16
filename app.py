@@ -32,7 +32,11 @@ from core.config import (  # noqa: E402
 )
 from core.drive import DriveClient, DriveError, parse_drive_folder_url  # noqa: E402
 from core.face_engine import FaceEngine, ensure_models  # noqa: E402
-from core.image_utils import bgr_to_rgb, decode_image_bytes  # noqa: E402
+from core.image_utils import (  # noqa: E402
+    bgr_to_rgb,
+    decode_image_bytes,
+    encode_jpeg_bytes,
+)
 from core.pg_index_store import PgIndexStore  # noqa: E402
 from core.pipeline import IndexOptions, build_index, search_embeddings  # noqa: E402
 from core.postgres_store import PostgresError, PostgresStore  # noqa: E402
@@ -406,27 +410,38 @@ def get_download_file(
     return client.fetch_file_bytes(file_id, resource_key)
 
 
-@st.cache_data(ttl=1800, max_entries=4, show_spinner=False)
-def build_results_zip(
+@st.cache_data(ttl=1800, max_entries=8, show_spinner=False)
+def build_preview_zip(
     entries: tuple[tuple[str, str], ...],
     api_key: str,
     credentials_identity: str,
     resource_key: str | None,
 ) -> bytes:
+    """Eşleşen fotoğrafların önizleme (thumbnail) hallerini ZIP'ler."""
     buffer = io.BytesIO()
     used: dict[str, int] = {}
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
         for file_id, name in entries:
             try:
-                fetched = get_download_file(
-                    file_id, api_key, credentials_identity, resource_key
+                image = get_display_image(
+                    file_id,
+                    PREVIEW_THUMB_SIZE,
+                    api_key,
+                    credentials_identity,
+                    resource_key,
                 )
             except Exception:
-                fetched = None
-            if fetched is None:
+                image = None
+            if image is None:
                 continue
-            data, _mime = fetched
+            data = encode_jpeg_bytes(image, quality=80)
+            if not data:
+                continue
             base = (name or file_id).strip() or file_id
+            if "." in base:
+                base = base.rsplit(".", 1)[0] + ".jpg"
+            else:
+                base = base + ".jpg"
             count = used.get(base, 0)
             used[base] = count + 1
             if count:
@@ -1071,16 +1086,20 @@ else:
             st.caption("Gelişmiş ayarlardan hassasiyeti düşürmeyi dene.")
         else:
             if st.button(
-                f"Tümünü indir ({len(results)})",
+                f"Tümünü indir · önizleme ({len(results)})",
                 key=f"zip_request_{key}",
                 width="stretch",
-                help="Eşleşen tüm fotoğrafları tek bir ZIP dosyası olarak indir.",
+                help=(
+                    "Eşleşen fotoğrafların küçük (önizleme) hallerini tek ZIP "
+                    "dosyası olarak indirir. Orijinal kalite için kartlardaki "
+                    "'Fotoğrafı indir' butonunu kullan."
+                ),
             ):
                 st.session_state["_zip_request_key"] = key
 
             if st.session_state.get("_zip_request_key") == key:
-                with st.spinner("Tüm eşleşen fotoğraflar hazırlanıyor..."):
-                    zip_bytes = build_results_zip(
+                with st.spinner("Önizlemeler paketleniyor..."):
+                    zip_bytes = build_preview_zip(
                         tuple((r["file_id"], r["name"]) for r in results),
                         api_key,
                         credentials_identity,
@@ -1090,13 +1109,11 @@ else:
                     st.download_button(
                         "ZIP dosyasını indir",
                         zip_bytes,
-                        file_name="eslesen_fotograflar.zip",
+                        file_name="eslesen_onizlemeler.zip",
                         mime="application/zip",
                         width="stretch",
                         key=f"zip_download_{key}",
                     )
-                else:
-                    st.caption("İndirilecek fotoğraf hazırlanamadı.")
 
             columns = st.columns(3, gap="medium")
 
