@@ -349,9 +349,13 @@ def rule() -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def get_engine_cached() -> FaceEngine:
-    yunet_path, sface_path = ensure_models()
-    return FaceEngine(yunet_path, sface_path)
+def get_engine_cached() -> FaceEngine | None:
+    """None döner; hata mesajı çağıran tarafta gösterilmeli."""
+    try:
+        yunet_path, sface_path = ensure_models()
+        return FaceEngine(yunet_path, sface_path)
+    except Exception:
+        return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -361,10 +365,14 @@ def get_drive_client_cached(api_key: str, credentials_identity: str) -> DriveCli
 
 
 @st.cache_resource(show_spinner=False)
-def get_store_cached(key: str) -> PgIndexStore:
+def get_store_cached(key: str) -> PgIndexStore | None:
+    """None döner; pg bağlantısı yoksa veya hata oluşursa crash olmaz."""
     if pg is None:
-        raise PostgresError("Supabase bağlantısı kurulamadı.")
-    return PgIndexStore(pg, key)
+        return None
+    try:
+        return PgIndexStore(pg, key)
+    except Exception:
+        return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -385,6 +393,11 @@ def analyze_upload_cached(data: bytes, det_threshold: float, min_face: int) -> d
         }
 
     engine = get_engine_cached()
+    if engine is None:
+        return {
+            "error": "Yüz modeli yüklenemedi. İnternet bağlantısını kontrol edip sayfayı yenile.",
+            "faces": [],
+        }
     faces, _ = engine.analyze(
         image_bgr,
         det_threshold=det_threshold,
@@ -667,6 +680,13 @@ def run_indexing() -> None:
     try:
         with st.spinner("Hazırlanıyor..."):
             engine = get_engine_cached()
+        if engine is None:
+            status_box.caption("Model yüklenemedi.")
+            st.error(
+                "Yüz tanıma modeli indirilemedi veya başlatılamadı. "
+                "İnternet bağlantısını kontrol edip sayfayı yenile."
+            )
+            return
 
         store.set_meta("folder_url", folder_url.strip())
         store.set_meta("folder_id", folder_id)
@@ -810,7 +830,10 @@ def update_saved_folder(item_key: str, url: str) -> None:
     st.session_state["_pending_force"] = False
 
 
-saved_folders = list_saved_folders()
+try:
+    saved_folders = list_saved_folders()
+except Exception:
+    saved_folders = []
 
 indexing_locked = st.session_state.get("_pending_force") is not None
 
@@ -894,6 +917,8 @@ store: PgIndexStore | None = None
 if selected_saved_key:
     key = selected_saved_key
     store = get_store_cached(key)
+    if store is None:
+        st.warning("Seçili klasör yüklenemedi. Supabase bağlantısını kontrol et.")
 elif folder_id:
     key = folder_key(folder_id, resource_key, include_subfolders, thumb_size)
     store = get_store_cached(key)
@@ -995,7 +1020,7 @@ elif scan_clicked or rescan_clicked:
     st.rerun()
 
 if indexing_locked:
-    force_reindex = bool(st.session_state.pop("_pending_force"))
+    force_reindex = bool(st.session_state.pop("_pending_force", False))
     try:
         run_indexing()
     except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
