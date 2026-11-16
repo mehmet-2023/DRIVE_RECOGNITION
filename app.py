@@ -996,7 +996,12 @@ elif scan_clicked or rescan_clicked:
 
 if indexing_locked:
     force_reindex = bool(st.session_state.pop("_pending_force"))
-    run_indexing()
+    try:
+        run_indexing()
+    except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
+        st.warning("Bağlantı kesildi; tarama durdu. Tekrar başlatabilirsin.")
+    except Exception as _run_exc:
+        st.error(f"Beklenmeyen hata: {_run_exc}")
 
 rule()
 
@@ -1092,6 +1097,9 @@ else:
     with st.spinner("Sonuçlar hazırlanıyor..."):
         try:
             matrix, metas = store.load_matrix()
+        except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
+            st.warning("Bağlantı kesildi. Sayfayı yenilemeyi dene.")
+            st.stop()
         except Exception:
             st.error(
                 "Kayıtlı indeks okunamadı. Supabase bağlantısını kontrol edip "
@@ -1149,6 +1157,9 @@ else:
                             credentials_identity,
                             resource_key,
                         )
+                except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
+                    zip_bytes = b""
+                    st.warning("Bağlantı kesildi; ZIP oluşturulamadı. Tekrar dene.")
                 except Exception:
                     zip_bytes = b""
                 if zip_bytes:
@@ -1176,6 +1187,8 @@ else:
                                 credentials_identity,
                                 resource_key,
                             )
+                        except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
+                            image_bgr = None
                         except Exception:
                             image_bgr = None
                         if image_bgr is not None:
@@ -1199,6 +1212,8 @@ else:
                                 credentials_identity,
                                 resource_key,
                             )
+                        except _DISCONNECT_EXC:  # type: ignore[misc]  # noqa: E722
+                            download_file = None
                         except Exception:
                             download_file = None
                         if download_file is not None:
