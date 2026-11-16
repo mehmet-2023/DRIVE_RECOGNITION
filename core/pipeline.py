@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ class IndexOptions:
     max_faces: int = 8
     max_images: int = 0
     force: bool = False
-    workers: int = 8
+    workers: int = 4
     sync_batch: int = 100
 
 
@@ -122,7 +123,8 @@ def build_index(
     cached_skipped = 0
     batch: list[dict] = []
     sync_errors: list[str] = []
-    workers = max(1, min(int(options.workers), 12))
+    workers = 4
+    chunk_size = 16
     executor = ThreadPoolExecutor(max_workers=workers)
 
     def flush_batch(force: bool = False) -> None:
@@ -139,8 +141,8 @@ def build_index(
         batch = []
 
     try:
-        for start in range(0, len(todo), 64):
-            chunk = todo[start : start + 64]
+        for start in range(0, len(todo), chunk_size):
+            chunk = todo[start : start + chunk_size]
 
             if load_cached is not None:
                 try:
@@ -149,19 +151,28 @@ def build_index(
                     load_cached = None
                     cached_rows = []
                 if cached_rows:
-                    store.import_rows(cached_rows)
-                    cached_ids = {
-                        str(row.get("file_id"))
-                        for row in cached_rows
-                        if row.get("file_id")
-                    }
-                    chunk = [item for item in chunk if item.id not in cached_ids]
-                    cached_skipped += len(cached_ids)
+                    try:
+                        store.import_rows(cached_rows)
+                        cached_ids = {
+                            str(row.get("file_id"))
+                            for row in cached_rows
+                            if row.get("file_id")
+                        }
+                        chunk = [
+                            item for item in chunk if item.id not in cached_ids
+                        ]
+                        cached_skipped += len(cached_ids)
+                    except Exception:
+                        pass
 
-            claimed_ids = store.claim_images(
-                [item.id for item in chunk],
-                force=options.force,
-            )
+            try:
+                claimed_ids = store.claim_images(
+                    [item.id for item in chunk],
+                    force=options.force,
+                )
+            except Exception:
+                claimed_ids = {item.id for item in chunk}
+
             realtime_skipped += len(chunk) - len(claimed_ids)
             chunk = [item for item in chunk if item.id in claimed_ids]
             if not chunk:
@@ -178,7 +189,7 @@ def build_index(
             }
 
             for future in as_completed(future_map):
-                item = future_map[future]
+                item = future_map.pop(future)
                 image = None
                 error_text: str | None = None
 
@@ -186,10 +197,19 @@ def build_index(
                     image = future.result()
                 except Exception as exc:
                     error_text = str(exc)[:300]
+                finally:
+                    del future
 
                 if image is None:
-                    error_text = error_text or "Görsel indirilemedi veya çözülemedi."
-                    store.save_error(item.id, item.name, item.path, error_text)
+                    error_text = (
+                        error_text or "Görsel indirilemedi veya çözülemedi."
+                    )
+                    try:
+                        store.save_error(
+                            item.id, item.name, item.path, error_text
+                        )
+                    except Exception as exc:
+                        sync_errors.append(str(exc)[:300])
                     counters["error"] += 1
                     row = encode_row(
                         item.id,
@@ -213,7 +233,12 @@ def build_index(
                         )
                     except Exception as exc:
                         error_text = f"Yüz analizi hatası: {exc}"[:300]
-                        store.save_error(item.id, item.name, item.path, error_text)
+                        try:
+                            store.save_error(
+                                item.id, item.name, item.path, error_text
+                            )
+                        except Exception as db_exc:
+                            sync_errors.append(str(db_exc)[:300])
                         counters["error"] += 1
                         row = encode_row(
                             item.id,
@@ -227,15 +252,18 @@ def build_index(
                         )
                     else:
                         status = "done" if faces else "no_face"
-                        store.save_result(
-                            item.id,
-                            item.name,
-                            item.path,
-                            width,
-                            height,
-                            faces,
-                            status,
-                        )
+                        try:
+                            store.save_result(
+                                item.id,
+                                item.name,
+                                item.path,
+                                width,
+                                height,
+                                faces,
+                                status,
+                            )
+                        except Exception as db_exc:
+                            sync_errors.append(str(db_exc)[:300])
                         if faces:
                             counters["done"] += 1
                             counters["faces"] += len(faces)
@@ -251,6 +279,8 @@ def build_index(
                             None,
                             faces,
                         )
+                    finally:
+                        del image
 
                 batch.append(row)
                 processed += 1
@@ -262,16 +292,22 @@ def build_index(
                         counters,
                     )
                 flush_batch()
+
+            gc.collect()
     finally:
-        executor.shutdown(wait=True)
+        executor.shutdown(wait=True, cancel_futures=True)
         flush_batch(force=True)
+        gc.collect()
 
     skipped += realtime_skipped + cached_skipped
-    store.set_meta("folder_id", folder_id)
-    store.set_meta(
-        "last_indexed",
-        datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    )
+    try:
+        store.set_meta("folder_id", folder_id)
+        store.set_meta(
+            "last_indexed",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+    except Exception as exc:
+        sync_errors.append(str(exc)[:300])
 
     return {
         "total_found": total_found,
@@ -292,12 +328,24 @@ def search_embeddings(
     threshold: float = 0.50,
     max_results: int | None = None,
 ) -> list[dict]:
-    if matrix.size == 0 or not probes or not metas:
+    if matrix is None or matrix.size == 0 or not probes or not metas:
         return []
 
-    probe_matrix = np.stack(
-        [np.asarray(probe, dtype=np.float32).reshape(-1) for probe in probes]
-    )
+    if matrix.ndim != 2 or matrix.shape[0] != len(metas):
+        return []
+
+    valid_probes = []
+    for probe in probes:
+        if probe is None:
+            continue
+        arr = np.asarray(probe, dtype=np.float32).reshape(-1)
+        if arr.size == matrix.shape[1]:
+            valid_probes.append(arr)
+
+    if not valid_probes:
+        return []
+
+    probe_matrix = np.stack(valid_probes)
     norms = np.linalg.norm(probe_matrix, axis=1, keepdims=True)
     np.divide(probe_matrix, norms, out=probe_matrix, where=norms > 1e-8)
 
@@ -310,11 +358,16 @@ def search_embeddings(
 
     for raw_index in candidate_indices:
         index = int(raw_index)
+        if index < 0 or index >= len(metas):
+            continue
         meta = metas[index]
+        file_id = meta.get("file_id")
+        if not file_id:
+            continue
         score = float(best_scores[index])
-        current = best_by_file.get(meta["file_id"])
+        current = best_by_file.get(file_id)
         if current is None or score > current["score"]:
-            best_by_file[meta["file_id"]] = {
+            best_by_file[file_id] = {
                 **meta,
                 "score": score,
                 "probe_index": int(best_probes[index]),
