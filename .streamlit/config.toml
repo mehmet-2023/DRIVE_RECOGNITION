@@ -13,6 +13,8 @@ showErrorDetails = "type"
 [server]
 maxUploadSize = 50
 enableXsrfProtection = true
+fileWatcherType = "none"
+runOnSave = false
 
 [browser]
 gatherUsageStats = false
