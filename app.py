@@ -611,6 +611,27 @@ def run_indexing() -> None:
         with st.spinner("Hazırlanıyor..."):
             engine = get_engine_cached()
 
+        store.set_meta("folder_url", folder_url.strip())
+        store.set_meta("folder_id", folder_id)
+        store.set_meta("folder_hidden", "1" if hide_folder else "0")
+        store.set_meta(
+            "added_at",
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        )
+        try:
+            folder_meta = get_folder_meta_cached(
+                folder_id, api_key, credentials_identity
+            )
+        except Exception:
+            folder_meta = {}
+        if folder_meta.get("name"):
+            store.set_meta("folder_title", folder_meta["name"])
+        drive_date = folder_meta.get("created_time") or folder_meta.get(
+            "modified_time"
+        )
+        if drive_date:
+            store.set_meta("folder_date", drive_date)
+
         def on_status(message: str) -> None:
             status_box.caption(message)
 
@@ -645,27 +666,7 @@ def run_indexing() -> None:
         )
 
         store.flush()
-        store.set_meta("folder_url", folder_url.strip())
-        store.set_meta("folder_id", folder_id)
-        store.set_meta("folder_hidden", "1" if hide_folder else "0")
         store.set_meta("folder_count", str(summary["total_found"]))
-        store.set_meta(
-            "added_at",
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        )
-        try:
-            folder_meta = get_folder_meta_cached(
-                folder_id, api_key, credentials_identity
-            )
-        except Exception:
-            folder_meta = {}
-        if folder_meta.get("name"):
-            store.set_meta("folder_title", folder_meta["name"])
-        drive_date = folder_meta.get("created_time") or folder_meta.get(
-            "modified_time"
-        )
-        if drive_date:
-            store.set_meta("folder_date", drive_date)
         progress.progress(1.0, text="Bitti")
 
         counters = summary["counters"]
