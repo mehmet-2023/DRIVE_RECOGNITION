@@ -749,9 +749,13 @@ def run_indexing() -> None:
         store.set_meta("folder_count", str(summary["total_found"]))
         if pg is not None and scanned_folders:
             try:
-                pg.register_indexed_folders(scanned_folders, key)
+                # Kök klasörü alt klasör olarak kaydetme; sadece gerçek alt klasörleri kaydet
+                sub_folders = [fid for fid in scanned_folders if fid != folder_id]
+                if sub_folders:
+                    pg.register_indexed_folders(sub_folders, key)
             except Exception:
                 pass
+
         progress.progress(1.0, text="Bitti")
 
         counters = summary["counters"]
