@@ -1098,13 +1098,17 @@ else:
                 st.session_state["_zip_request_key"] = key
 
             if st.session_state.get("_zip_request_key") == key:
-                with st.spinner("Önizlemeler paketleniyor..."):
-                    zip_bytes = build_preview_zip(
-                        tuple((r["file_id"], r["name"]) for r in results),
-                        api_key,
-                        credentials_identity,
-                        resource_key,
-                    )
+                zip_bytes = b""
+                try:
+                    with st.spinner("Önizlemeler paketleniyor..."):
+                        zip_bytes = build_preview_zip(
+                            tuple((r["file_id"], r["name"]) for r in results),
+                            api_key,
+                            credentials_identity,
+                            resource_key,
+                        )
+                except Exception:
+                    zip_bytes = b""
                 if zip_bytes:
                     st.download_button(
                         "ZIP dosyasını indir",
@@ -1114,6 +1118,8 @@ else:
                         width="stretch",
                         key=f"zip_download_{key}",
                     )
+                else:
+                    st.caption("Önizleme paketi hazırlanamadı, tekrar dene.")
 
             columns = st.columns(3, gap="medium")
 
