@@ -489,8 +489,8 @@ class DriveClient:
         root_folder_id: str,
         include_subfolders: bool = True,
         resource_key: str | None = None,
-        max_folders: int = 300,
-        max_depth: int = 20,
+        max_folders: int = 20000,
+        max_depth: int = 100,
     ) -> Iterator[DriveItem]:
         stack: list[tuple[str, str, str | None, int]] = [
             (root_folder_id, "", resource_key, 0)

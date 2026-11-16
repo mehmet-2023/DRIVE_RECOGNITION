@@ -465,8 +465,6 @@ def list_saved_folders() -> list[dict]:
             store = IndexStore(path)
             stats = store.stats()
             image_count = int(stats.get("images") or 0)
-            if image_count <= 0:
-                continue
 
             hidden_flag = store.meta_get("folder_hidden")
             if hidden_flag is None:
@@ -545,13 +543,16 @@ def list_saved_folders() -> list[dict]:
             if not count:
                 count = image_count
 
+            if not folder_id and image_count <= 0:
+                continue
+
             folders.append(
                 {
                     "key": path.stem,
                     "url": folder_url,
                     "folder_id": folder_id,
                     "linked": bool(folder_id),
-                    "title": title or folder_url or f"Klasör {path.stem[:8]}",
+                    "title": title or f"Klasör {path.stem[:8]}",
                     "count": count,
                     "indexed": image_count,
                     "date": drive_date or added_at,
@@ -730,6 +731,9 @@ def run_indexing() -> None:
                 f" {realtime_skipped} fotoğraf eşzamanlı tarama "
                 "nedeniyle atlandı."
             )
+        warn_list = list(summary.get("warnings") or [])
+        if warn_list:
+            message += " Uyarı: " + " ".join(warn_list[:3])
         status_box.caption("Tarama bitti.")
         flash("success", message)
         st.rerun()
@@ -775,7 +779,15 @@ def select_saved_folder(item_key: str, url: str) -> None:
     st.session_state["folder_url"] = url or ""
 
 
+def update_saved_folder(item_key: str, url: str) -> None:
+    st.session_state["active_folder_key"] = item_key
+    st.session_state["folder_url"] = url or ""
+    st.session_state["_pending_force"] = False
+
+
 saved_folders = list_saved_folders()
+
+indexing_locked = st.session_state.get("_pending_force") is not None
 
 folder_mode = "Yeni klasör linki"
 if saved_folders:
@@ -785,6 +797,7 @@ if saved_folders:
         horizontal=True,
         label_visibility="collapsed",
         key="folder_mode",
+        disabled=indexing_locked,
     )
 
 selected_saved_key: str | None = None
@@ -811,8 +824,17 @@ if folder_mode == "Mevcut ekli klasörler":
                     "Seçili" if is_active else "Bu klasörü seç",
                     key=f"pick_{item['key']}",
                     width="stretch",
-                    disabled=is_active,
+                    disabled=is_active or indexing_locked,
                     on_click=select_saved_folder,
+                    args=(item["key"], item["url"]),
+                )
+                st.button(
+                    "Güncelle",
+                    key=f"update_{item['key']}",
+                    width="stretch",
+                    disabled=indexing_locked or not item["linked"],
+                    help="Bu klasördeki yeni/eksik fotoğrafları tarar.",
+                    on_click=update_saved_folder,
                     args=(item["key"], item["url"]),
                 )
     folder_url = st.session_state.get("folder_url", "")
@@ -852,7 +874,9 @@ elif folder_id:
     store = get_store_cached(key)
 
 if folder_id and store is not None:
-    if not store.meta_get("folder_title") or not store.meta_get("folder_url"):
+    if (not store.meta_get("folder_title") or not store.meta_get("folder_url")) and (
+        store.stats().get("images", 0) > 0
+    ):
         try:
             entered_meta = get_folder_meta_cached(
                 folder_id, api_key, credentials_identity
@@ -893,13 +917,14 @@ if folder_id and not folder_error:
             "klasörler' listesinde görünmez. Gizli klasörleri yalnızca "
             "linki tekrar girerek açabilirsin."
         ),
+        disabled=indexing_locked,
     )
 
 scan_clicked = st.button(
     "Taramayı başlat",
     type="primary",
     width="stretch",
-    disabled=not folder_id,
+    disabled=not folder_id or indexing_locked,
 )
 
 has_index = False
@@ -915,10 +940,15 @@ if has_index:
         "Yeniden tara",
         width="stretch",
         help="Kayıtlı fotoğrafları atlamadan tüm klasörü baştan tarar.",
+        disabled=indexing_locked,
     )
 
 if scan_clicked or rescan_clicked:
-    force_reindex = rescan_clicked
+    st.session_state["_pending_force"] = rescan_clicked
+    st.rerun()
+
+if indexing_locked:
+    force_reindex = bool(st.session_state.pop("_pending_force"))
     run_indexing()
 
 rule()
