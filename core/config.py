@@ -150,33 +150,85 @@ def get_service_account_info() -> dict[str, Any] | None:
     return None
 
 
-def get_supabase_config() -> dict[str, Any] | None:
-    """Supabase Postgres bağlantı bilgisini secrets/env üzerinden okur."""
-    dsn = get_secret("SUPABASE_DB_URL") or get_secret("DATABASE_URL")
-    if dsn:
-        return {"dsn": str(dsn)}
+def _local_secrets() -> dict[str, Any]:
+    """Streamlit dışında (ör. ``indexer.py``) secrets.toml dosyasını okur."""
+    for candidate in (
+        Path(".streamlit/secrets.toml"),
+        Path(__file__).resolve().parent.parent / ".streamlit/secrets.toml",
+    ):
+        if not candidate.exists():
+            continue
+        try:
+            import tomllib
 
+            with candidate.open("rb") as handle:
+                data = tomllib.load(handle)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
+
+
+def _d1_section() -> dict[str, Any]:
+    """``[cloudflare_d1]`` tablosunu Streamlit secrets veya dosyadan okur."""
     try:
-        if "supabase" in st.secrets:
-            section = dict(st.secrets["supabase"])
-            if section.get("host") or section.get("dsn"):
+        if "cloudflare_d1" in st.secrets:
+            section = dict(st.secrets["cloudflare_d1"])
+            if section:
                 return section
     except Exception:
         pass
 
-    host = get_secret("SUPABASE_HOST") or get_secret("PGHOST")
-    if host:
-        password = get_secret("SUPABASE_PASSWORD") or get_secret("PGPASSWORD")
-        return {
-            "host": str(host),
-            "port": int(get_secret("SUPABASE_PORT", get_secret("PGPORT", 5432))),
-            "dbname": str(get_secret("SUPABASE_DB", get_secret("PGDATABASE", "postgres"))),
-            "user": str(get_secret("SUPABASE_USER", get_secret("PGUSER", "postgres"))),
-            "password": str(password or ""),
-            "sslmode": str(get_secret("SUPABASE_SSLMODE", "require")),
-        }
+    local = _local_secrets().get("cloudflare_d1")
+    return dict(local) if isinstance(local, dict) else {}
 
+
+def get_d1_config() -> dict[str, Any] | None:
+    """Cloudflare D1 bağlantı bilgisini secrets/env üzerinden okur.
+
+    Tek düz anahtarlar veya ``[cloudflare_d1]`` tablosu kullanılabilir::
+
+        CLOUDFLARE_ACCOUNT_ID
+        CLOUDFLARE_D1_DATABASE_ID
+        CLOUDFLARE_D1_API_TOKEN
+    """
+    section = _d1_section()
+    local = _local_secrets()
+
+    def pick(*names: str) -> str | None:
+        for name in names:
+            value = get_secret(name)
+            if value in (None, ""):
+                value = local.get(name)
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    account_id = pick(
+        "CLOUDFLARE_ACCOUNT_ID", "CF_ACCOUNT_ID", "D1_ACCOUNT_ID"
+    ) or section.get("account_id")
+    database_id = pick(
+        "CLOUDFLARE_D1_DATABASE_ID", "CF_D1_DATABASE_ID", "D1_DATABASE_ID"
+    ) or section.get("database_id")
+    api_token = pick(
+        "CLOUDFLARE_D1_API_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN"
+    ) or section.get("api_token")
+
+    if account_id and database_id and api_token:
+        return {
+            "account_id": str(account_id),
+            "database_id": str(database_id),
+            "api_token": str(api_token),
+        }
     return None
+
+
+def get_storage_config() -> tuple[str | None, dict[str, Any] | None]:
+    """Aktif veritabanı backend'ini seçer (Cloudflare D1)."""
+    d1_config = get_d1_config()
+    if d1_config:
+        return "d1", d1_config
+    return None, None
 
 
 def folder_key(

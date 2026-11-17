@@ -488,7 +488,7 @@ def main_app() -> None:
         folder_key,
         get_secret,
         get_service_account_info,
-        get_supabase_config,
+        get_storage_config,
     )
     from core.drive import DriveClient, DriveError, parse_drive_folder_url
     from core.face_engine import FaceEngine, ensure_models
@@ -497,12 +497,16 @@ def main_app() -> None:
         decode_image_bytes,
         encode_jpeg_bytes,
     )
-    from core.pg_index_store import PgIndexStore
+    from core.pg_index_store import PgIndexStore, clear_matrix_cache
     from core.pipeline import IndexOptions, build_index, search_embeddings
-    from core.postgres_store import PostgresError, PostgresStore
+    from core.storage import create_store
+    from core.store_base import StoreError
 
     guard = get_server_guard()
     system_overloaded, overload_reason, used_mb, limit_mb = guard.evaluate()
+    if system_overloaded:
+        # Bellek kritik seviyedeyse büyük embedding matrislerini bırak.
+        clear_matrix_cache()
 
     @st.cache_resource(show_spinner=False)
     def get_engine_cached() -> FaceEngine | None:
@@ -520,11 +524,11 @@ def main_app() -> None:
         return DriveClient(api_key=api_key or None, service_account_info=info)
 
     @st.cache_resource(show_spinner=False)
-    def get_postgres_cached(config_identity: str) -> PostgresStore:
-        config = get_supabase_config()
+    def get_store_cached(backend: str, config_identity: str):
+        backend, config = get_storage_config()
         if not config:
-            raise PostgresError("Kalıcı kayıt ayarı bulunamadı.")
-        return PostgresStore(config)
+            raise StoreError("Kalıcı kayıt ayarı bulunamadı.")
+        return create_store(backend, config)
 
     @st.cache_data(show_spinner=False, max_entries=16)
     def analyze_upload_cached(
@@ -670,7 +674,7 @@ def main_app() -> None:
             return {}
 
     service_account_info = get_service_account_info()
-    supabase_config = get_supabase_config()
+    storage_backend, storage_config = get_storage_config()
     api_key = str(get_secret("GOOGLE_DRIVE_API_KEY") or "")
     credentials_identity = str(
         (service_account_info or {}).get("client_email") or "none"
@@ -681,17 +685,23 @@ def main_app() -> None:
     except Exception:
         client = DriveClient(api_key=api_key or None)
 
-    pg: PostgresStore | None = None
-    if supabase_config:
+    pg = None
+    if storage_backend and storage_config:
         try:
             config_identity = hashlib.sha1(
                 json.dumps(
-                    supabase_config, sort_keys=True, default=str
+                    storage_config, sort_keys=True, default=str
                 ).encode("utf-8")
             ).hexdigest()
-            pg = get_postgres_cached(config_identity)
+            pg = get_store_cached(storage_backend, config_identity)
         except Exception:
             pg = None
+    if not (storage_backend and storage_config):
+        st.warning(
+            "Cloudflare D1 ayarları bulunamadı. .streamlit/secrets.toml "
+            "dosyasına [cloudflare_d1] tablosu (account_id, database_id, "
+            "api_token) ekleyin."
+        )
 
     def get_store_safe(key: str) -> PgIndexStore | None:
         if pg is None:
@@ -707,7 +717,8 @@ def main_app() -> None:
 
         try:
             rows = pg.list_folders()
-        except Exception:
+        except Exception as exc:
+            st.warning(f"Kayıtlı klasörler okunamadı: {exc}")
             return []
 
         folders: list[dict] = []
@@ -716,117 +727,149 @@ def main_app() -> None:
             meta = row.get("meta") or {}
             if not key:
                 continue
-            try:
-                hidden_flag = meta.get("folder_hidden")
-                if hidden_flag is None:
+
+            # Tek bir klasördeki hata, kaydın listeden sessizce düşmesine
+            # neden olmasın. Önce DB'deki meta ile güvenli bir kayıt kur,
+            # sonra eksik alanları Drive'dan zenginleştirmeyi dene.
+            folder_url = str(meta.get("folder_url") or "")
+            folder_id = str(meta.get("folder_id") or "") or None
+            title = str(meta.get("folder_title") or "")
+            drive_date = str(meta.get("folder_date") or "")
+            added_at = str(meta.get("added_at") or "")
+            folder_count_meta = str(meta.get("folder_count") or "")
+            is_hidden = str(meta.get("folder_hidden") or "0") == "1"
+            image_count = 0
+            resource_key = None
+
+            if meta.get("folder_hidden") is None:
+                is_hidden = False
+                try:
                     pg.set_folder_meta(key, "folder_hidden", "0")
-                    hidden_flag = "0"
-                if str(hidden_flag) == "1":
-                    continue
+                except Exception:
+                    pass
 
+            if is_hidden:
+                continue
+
+            store: PgIndexStore | None = None
+            try:
                 store = PgIndexStore(pg, key)
-                image_count = int(store.stats().get("images") or 0)
+                version = (
+                    f"{meta.get('last_indexed') or ''}|"
+                    f"{meta.get('folder_count') or ''}"
+                )
+                image_count = int(
+                    store.stats_cached(version).get("images") or 0
+                )
+            except Exception:
+                store = None
 
-                folder_url = str(meta.get("folder_url") or "")
-                folder_id = str(meta.get("folder_id") or "") or None
-                title = str(meta.get("folder_title") or "")
-                drive_date = str(meta.get("folder_date") or "")
-                added_at = str(meta.get("added_at") or "")
-                folder_count_meta = str(meta.get("folder_count") or "")
+            if not folder_id and folder_url:
+                try:
+                    folder_id, resource_key = parse_drive_folder_url(
+                        folder_url
+                    )
+                except Exception:
+                    folder_id = None
 
-                resource_key = None
-                if not folder_id and folder_url:
-                    try:
-                        folder_id, resource_key = parse_drive_folder_url(
-                            folder_url
-                        )
-                    except DriveError:
-                        folder_id = None
-
-                if not folder_id:
+            if not folder_id and store is not None:
+                try:
                     sample = store.sample_image()
-                    if sample is not None:
-                        sample_id, sample_path = sample
-                        resolved = resolve_folder_meta_cached(
-                            sample_id,
-                            sample_path.count(" / "),
-                            api_key,
-                            credentials_identity,
+                except Exception:
+                    sample = None
+                if sample is not None:
+                    sample_id, sample_path = sample
+                    resolved = resolve_folder_meta_cached(
+                        sample_id,
+                        sample_path.count(" / "),
+                        api_key,
+                        credentials_identity,
+                    )
+                    resolved_id = resolved.get("id")
+                    if resolved_id:
+                        folder_id = resolved_id
+                        folder_url = folder_url or (
+                            "https://drive.google.com/drive/folders/"
+                            f"{resolved_id}"
                         )
-                        resolved_id = resolved.get("id")
-                        if resolved_id:
-                            folder_id = resolved_id
-                            folder_url = folder_url or (
-                                "https://drive.google.com/drive/folders/"
-                                f"{resolved_id}"
-                            )
+                        try:
                             store.set_meta("folder_id", resolved_id)
                             store.set_meta("folder_url", folder_url)
-                            if resolved.get("name"):
-                                title = title or resolved["name"]
+                        except Exception:
+                            pass
+                        if resolved.get("name"):
+                            title = title or resolved["name"]
+                            try:
                                 store.set_meta(
                                     "folder_title", resolved["name"]
                                 )
-                            resolved_date = resolved.get(
-                                "created_time"
-                            ) or resolved.get("modified_time")
-                            if resolved_date:
-                                drive_date = drive_date or resolved_date
+                            except Exception:
+                                pass
+                        resolved_date = resolved.get(
+                            "created_time"
+                        ) or resolved.get("modified_time")
+                        if resolved_date:
+                            drive_date = drive_date or resolved_date
+                            try:
                                 store.set_meta("folder_date", resolved_date)
+                            except Exception:
+                                pass
 
-                if folder_id and (not title or not drive_date):
-                    drive_meta = get_folder_meta_cached(
-                        folder_id, api_key, credentials_identity
-                    )
-                    title = title or drive_meta.get("name") or ""
-                    drive_date = (
-                        drive_date
-                        or drive_meta.get("created_time")
-                        or drive_meta.get("modified_time")
-                        or ""
-                    )
-
-                count = (
-                    int(folder_count_meta) if folder_count_meta.isdigit() else 0
+            if folder_id and (not title or not drive_date):
+                drive_meta = get_folder_meta_cached(
+                    folder_id, api_key, credentials_identity
                 )
-                if not count and folder_id:
-                    drive_count = get_folder_count_cached(
-                        folder_id, resource_key, api_key, credentials_identity
-                    )
-                    if drive_count >= 0:
-                        count = drive_count
-                        store.set_meta("folder_count", str(drive_count))
-                if not count:
-                    count = image_count
-
-                if not folder_id and image_count <= 0:
-                    continue
-
-                folders.append(
-                    {
-                        "key": key,
-                        "url": folder_url,
-                        "folder_id": folder_id,
-                        "linked": bool(folder_id),
-                        "title": title or f"Klasör {key[:8]}",
-                        "count": count,
-                        "indexed": image_count,
-                        "date": drive_date or added_at,
-                        "date_label": _format_drive_date(
-                            drive_date or added_at
-                        ),
-                    }
+                title = title or drive_meta.get("name") or ""
+                drive_date = (
+                    drive_date
+                    or drive_meta.get("created_time")
+                    or drive_meta.get("modified_time")
+                    or ""
                 )
-            except Exception:
-                continue
+
+            count = (
+                int(folder_count_meta) if folder_count_meta.isdigit() else 0
+            )
+            if not count and folder_id:
+                drive_count = get_folder_count_cached(
+                    folder_id, resource_key, api_key, credentials_identity
+                )
+                if drive_count >= 0:
+                    count = drive_count
+                    if store is not None:
+                        try:
+                            store.set_meta("folder_count", str(drive_count))
+                        except Exception:
+                            pass
+            if not count:
+                count = image_count
+
+            folders.append(
+                {
+                    "key": key,
+                    "url": folder_url,
+                    "folder_id": folder_id,
+                    "linked": bool(folder_id),
+                    "title": title or f"Klasör {key[:8]}",
+                    "count": count,
+                    "indexed": image_count,
+                    "date": drive_date or added_at,
+                    "date_label": _format_drive_date(
+                        drive_date or added_at
+                    ),
+                    "hidden": is_hidden,
+                }
+            )
 
         folders.sort(key=lambda item: item["date"], reverse=True)
         return folders
 
     if pg is None:
         st.error(
-            "Supabase bağlantısı kurulamadı. Uygulama tüm verileri Supabase'te "
-            "tutuyor; SUPABASE_DB_URL ayarını kontrol edip tekrar dene."
+            "Veritabanı bağlantısı kurulamadı. Uygulama tüm verileri "
+            "Cloudflare D1'de tutuyor; CLOUDFLARE_ACCOUNT_ID, "
+            "CLOUDFLARE_D1_DATABASE_ID ve CLOUDFLARE_D1_API_TOKEN "
+            "ayarlarını kontrol edip tekrar dene."
         )
         return
 
@@ -978,7 +1021,7 @@ def main_app() -> None:
         store = get_store_safe(key)
         if store is None:
             st.warning(
-                "Seçili klasör yüklenemedi. Supabase bağlantısını kontrol et."
+                "Seçili klasör yüklenemedi. Veritabanı bağlantısını kontrol et."
             )
     elif folder_id:
         key = folder_key(folder_id, resource_key, include_subfolders, thumb_size)
@@ -989,7 +1032,7 @@ def main_app() -> None:
             needs_meta = (
                 not store.meta_get("folder_title")
                 or not store.meta_get("folder_url")
-            ) and store.stats().get("images", 0) > 0
+            ) and store.stats_cached().get("images", 0) > 0
         except Exception:
             needs_meta = False
 
@@ -1026,9 +1069,23 @@ def main_app() -> None:
         st.caption("Bir klasör seç ya da yeni bir Drive klasör linki yapıştır.")
 
     if folder_id and not folder_error:
+        hide_key = f"hide_folder_{folder_id}"
+        # Widget durumu klasörler arasında taşınmasın ve mevcut klasörlerin
+        # gizlilik durumu kendiliğinden değişmesin: başlangıç değeri her
+        # zaman DB'deki folder_hidden değerinden gelsin.
+        if st.session_state.get("_hide_folder_ctx") != folder_id:
+            st.session_state.pop(hide_key, None)
+            st.session_state["_hide_folder_ctx"] = folder_id
+            stored_hidden = "0"
+            if store is not None:
+                try:
+                    stored_hidden = store.meta_get("folder_hidden", "0") or "0"
+                except Exception:
+                    stored_hidden = "0"
+            st.session_state[hide_key] = str(stored_hidden) == "1"
         hide_folder = st.checkbox(
             "Bu klasörü gizli tut",
-            key=f"hide_folder_{folder_id}",
+            key=hide_key,
             help=(
                 "Yeni bir yükleme ise işaretle: bu klasör 'Mevcut ekli "
                 "klasörler' listesinde görünmez. Gizli klasörleri yalnızca "
@@ -1047,7 +1104,7 @@ def main_app() -> None:
     has_index = False
     if store is not None:
         try:
-            has_index = store.stats()["images"] > 0
+            has_index = store.stats_cached().get("images", 0) > 0
         except Exception:
             has_index = False
 
